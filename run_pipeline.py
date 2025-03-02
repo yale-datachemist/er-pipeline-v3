@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import argparse
 import logging
 import os
@@ -20,7 +19,7 @@ def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Entity Resolution Pipeline for Yale University Library Catalog')
     
-    parser.add_argument('--config', type=str, default='config.yaml',
+    parser.add_argument('--config', type=str, default='config.yml',
                         help='Path to configuration file')
     
     parser.add_argument('--mode', type=str, choices=['dev', 'production'], default=None,

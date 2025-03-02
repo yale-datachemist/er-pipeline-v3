@@ -68,14 +68,14 @@ imputation_neighbors: 10
 
 # Clustering settings
 match_threshold: 0.7
-min_cluster_size: 2
-max_neighbors: 50
+min_cluster_size: 1
+max_neighbors: 500
 graph_batch_size: 1000  # Records per batch for graph building
 
 # LLM fallback settings
 use_llm_fallback: true
 llm_model: "gpt-4o"
-max_llm_requests: 100  # Limit number of LLM API calls
+max_llm_requests: 1000  # Limit number of LLM API calls
 
 # Environment-specific scaling parameters
 environment:

@@ -606,40 +606,6 @@ class WeaviateManager:
             
         except Exception as e:
             logger.error(f"Error clearing collections: {str(e)}")
-            return False    def get_entity_field_hashes(self, entity_id: str) -> Optional[Dict[str, str]]:
-        """
-        Retrieve field hashes for an entity from the EntityMap collection.
-        
-        Args:
-            entity_id: Entity ID to retrieve
-            
-        Returns:
-            Dictionary mapping field name -> hash, or None if not found
-        """
-        if not self.client:
-            logger.error("Not connected to Weaviate")
-            return None
-        
-        try:
-            collection = self.client.collections.get("EntityMap")
-            
-            # Query by entity_id for exact match
-            result = collection.query.fetch_objects(
-                filters=collection.query.filter.by_property("entity_id").equal(entity_id),
-                limit=1
-            )
-            
-            if result.objects:
-                # Deserialize the JSON string back to a dictionary
-                field_hashes_json = result.objects[0].properties.get("field_hashes_json", "{}")
-                try:
-                    return json.loads(field_hashes_json)
-                except json.JSONDecodeError as e:
-                    logger.error(f"Error parsing field_hashes_json for entity {entity_id}: {e}")
-                    return {}
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error retrieving entity field hashes: {str(e)}")
-            return None
+            return False    
+
+    

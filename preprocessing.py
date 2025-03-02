@@ -332,7 +332,7 @@ class DataProcessor:
             List of tuples (left_id, right_id, is_match)
         """
         try:
-            df = pd.read_csv(ground_truth_file, sep='\s+')
+            df = pd.read_csv(ground_truth_file)
             
             # Convert to list of tuples
             ground_truth = []
