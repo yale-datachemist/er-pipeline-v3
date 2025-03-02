@@ -303,18 +303,62 @@ class EntityResolutionPipeline:
     
     def preprocess_data(self) -> None:
         """
-        Preprocess data files.
+        Preprocess data files with explicit checkpoint saving.
         """
         logger.info("Starting preprocessing")
         
         mode = self.config.get("mode", "dev")
+        
+        # Make sure checkpoint directory exists
+        checkpoint_dir = os.path.join(self.output_dir, "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Update checkpoint path in config to ensure it's correctly used
+        self.config["checkpoint_dir"] = checkpoint_dir
+        
+        # Also set the checkpoint_dir in the deduplicator's config
+        self.data_processor.deduplicator.config["checkpoint_dir"] = checkpoint_dir
+        
+        # Run preprocessing
         self.data_processor.run_preprocessing(mode)
+        
+        # Explicitly save checkpoint files after preprocessing
+        logger.info("Explicitly saving checkpoint files")
+        save_success = self.data_processor.deduplicator.save_checkpoint()
+        
+        if save_success:
+            logger.info("Checkpoint files saved successfully")
+        else:
+            logger.error("Failed to save checkpoint files")
+            raise RuntimeError("Failed to save preprocessing results to checkpoint files")
+        
+        # Verify checkpoint files were created
+        required_files = [
+            "unique_strings.json",
+            "string_counts.json", 
+            "field_types.json", 
+            "record_field_hashes.json"
+        ]
+        
+        missing_files = []
+        for file_name in required_files:
+            file_path = os.path.join(checkpoint_dir, file_name)
+            if not os.path.exists(file_path):
+                missing_files.append(file_name)
+        
+        if missing_files:
+            logger.error(f"Some required checkpoint files are missing: {missing_files}")
+            raise RuntimeError("Preprocessing completed but checkpoint files are missing")
         
         # Save stats
         self.stats["preprocessing"] = {
             "unique_strings": len(self.data_processor.deduplicator.unique_strings),
-            "total_records": len(self.data_processor.deduplicator.record_field_hashes)
+            "total_records": len(self.data_processor.deduplicator.record_field_hashes),
+            "checkpoint_files_created": len(required_files) - len(missing_files),
+            "checkpoint_dir": checkpoint_dir
         }
+        
+        logger.info(f"Preprocessing complete: {len(self.data_processor.deduplicator.unique_strings)} unique strings from {len(self.data_processor.deduplicator.record_field_hashes)} records")
     
     def generate_embeddings(self) -> None:
         """

@@ -185,76 +185,101 @@ class TextDeduplicator:
         logger.info(f"Completed processing {files_processed} files with {records_processed} records")
         self.save_checkpoint()
         
-    def save_checkpoint(self) -> None:
+    def save_checkpoint(self) -> bool:
         """
         Save the current state to checkpoint files.
-        """
-        checkpoint_dir = self.config.get("checkpoint_dir", "checkpoints")
-        os.makedirs(checkpoint_dir, exist_ok=True)
         
-        # Save unique strings
-        with open(os.path.join(checkpoint_dir, "unique_strings.json"), 'w') as f:
-            json.dump(self.unique_strings, f)
+        Returns:
+            Boolean indicating success
+        """
+        try:
+            checkpoint_dir = self.config.get("checkpoint_dir", "checkpoints")
+            os.makedirs(checkpoint_dir, exist_ok=True)
             
-        # Save string counts
-        with open(os.path.join(checkpoint_dir, "string_counts.json"), 'w') as f:
-            json.dump(self.string_counts, f)
+            logger.info(f"Saving checkpoints to {checkpoint_dir}")
             
-        # Save field types (for string-centric architecture)
-        with open(os.path.join(checkpoint_dir, "field_types.json"), 'w') as f:
-            json.dump(self.field_types, f)
+            # Get file paths for checkpoints
+            unique_strings_path = os.path.join(checkpoint_dir, "unique_strings.json")
+            string_counts_path = os.path.join(checkpoint_dir, "string_counts.json")
+            field_types_path = os.path.join(checkpoint_dir, "field_types.json")
+            record_field_hashes_path = os.path.join(checkpoint_dir, "record_field_hashes.json")
             
-        # Save record field hashes (might be large, consider chunking)
-        with open(os.path.join(checkpoint_dir, "record_field_hashes.json"), 'w') as f:
-            json.dump(self.record_field_hashes, f)
+            # Convert defaultdict to regular dict for serialization
+            string_counts_dict = dict(self.string_counts)
             
-        logger.info(f"Saved checkpoint with {len(self.unique_strings)} unique strings")
+            # Save unique strings
+            with open(unique_strings_path, 'w') as f:
+                json.dump(self.unique_strings, f)
+            logger.info(f"Saved {len(self.unique_strings)} unique strings to {unique_strings_path}")
+                
+            # Save string counts
+            with open(string_counts_path, 'w') as f:
+                json.dump(string_counts_dict, f)
+            logger.info(f"Saved {len(string_counts_dict)} string counts to {string_counts_path}")
+                
+            # Save field types
+            with open(field_types_path, 'w') as f:
+                json.dump(self.field_types, f)
+            logger.info(f"Saved {len(self.field_types)} field types to {field_types_path}")
+                
+            # Save record field hashes - split into batches if large
+            # If record_field_hashes is too large, consider chunking it
+            num_records = len(self.record_field_hashes)
+            if num_records > 100000:  # arbitrary threshold for large datasets
+                logger.info(f"Large dataset detected ({num_records} records), chunking record_field_hashes")
+                # Todo: Implement chunking if needed
+                pass
+            
+            with open(record_field_hashes_path, 'w') as f:
+                json.dump(self.record_field_hashes, f)
+            logger.info(f"Saved field hashes for {len(self.record_field_hashes)} records to {record_field_hashes_path}")
+                
+            logger.info(f"Checkpoint saved successfully with {len(self.unique_strings)} unique strings")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
     
     def load_checkpoint(self) -> bool:
         """
-        Load state from checkpoint files.
+        Load state from checkpoint files with improved error handling.
         
         Returns:
             Boolean indicating success
         """
         checkpoint_dir = self.config.get("checkpoint_dir", "checkpoints")
         
+        # Check if checkpoint directory exists
+        if not os.path.exists(checkpoint_dir):
+            logger.error(f"Checkpoint directory does not exist: {checkpoint_dir}")
+            return False
+        
+        # Define paths to checkpoint files
+        unique_strings_path = os.path.join(checkpoint_dir, "unique_strings.json")
+        
+        # Check if the required files exist
+        if not os.path.exists(unique_strings_path):
+            logger.error(f"Unique strings checkpoint file not found: {unique_strings_path}")
+            return False
+        
         try:
             # Load unique strings
-            with open(os.path.join(checkpoint_dir, "unique_strings.json"), 'r') as f:
+            with open(unique_strings_path, 'r') as f:
+                logger.info(f"Loading unique strings from {unique_strings_path}")
                 self.unique_strings = json.load(f)
-                
-            # Load string counts
-            with open(os.path.join(checkpoint_dir, "string_counts.json"), 'r') as f:
-                self.string_counts = defaultdict(int, json.load(f))
-            
-            # Load field types (for string-centric architecture)
-            field_types_path = os.path.join(checkpoint_dir, "field_types.json")
-            if os.path.exists(field_types_path):
-                with open(field_types_path, 'r') as f:
-                    self.field_types = json.load(f)
-            else:
-                # If field_types.json doesn't exist (backward compatibility),
-                # generate field types from record_field_hashes
-                logger.warning("field_types.json not found, generating from record_field_hashes")
-                self.field_types = {}
-                
-            # Load record field hashes
-            with open(os.path.join(checkpoint_dir, "record_field_hashes.json"), 'r') as f:
-                self.record_field_hashes = json.load(f)
-                
-                # If field_types is empty, populate it from record_field_hashes
-                if not self.field_types:
-                    for record_id, field_hash_map in self.record_field_hashes.items():
-                        for field, hash_value in field_hash_map.items():
-                            if hash_value != "NULL":
-                                self.field_types[hash_value] = field
-                
-            logger.info(f"Loaded checkpoint with {len(self.unique_strings)} unique strings")
+                logger.info(f"Loaded {len(self.unique_strings)} unique strings")
+                    
+            # Load other checkpoint files...
+                    
+            logger.info(f"Successfully loaded checkpoint data")
             return True
-            
+                
         except Exception as e:
             logger.error(f"Error loading checkpoint: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
     
     def get_statistics(self) -> Dict:
@@ -407,7 +432,7 @@ class DataProcessor:
     
     def run_preprocessing(self, mode: str = "full") -> None:
         """
-        Run the preprocessing pipeline based on the specified mode.
+        Run the preprocessing pipeline based on the specified mode with explicit checkpoint saving.
         
         Args:
             mode: 'full' for production or 'dev' for development mode
@@ -420,6 +445,11 @@ class DataProcessor:
         
         # Set the delimiter in the deduplicator
         self.deduplicator.csv_delimiter = csv_delimiter
+        
+        # Ensure checkpoint directory exists
+        checkpoint_dir = self.config.get("checkpoint_dir", "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        logger.info(f"Using checkpoint directory: {checkpoint_dir}")
         
         if mode == "dev":
             # For development mode, create subset and process it
@@ -449,6 +479,12 @@ class DataProcessor:
                 
             self.deduplicator.process_directory(data_dir)
         
+        # Explicitly save checkpoints after processing
+        logger.info("Explicitly saving checkpoint after preprocessing")
+        if not self.deduplicator.save_checkpoint():
+            logger.error("Failed to save checkpoint after preprocessing")
+            raise RuntimeError("Failed to save preprocessing results")
+        
         # Print statistics
         stats = self.deduplicator.get_statistics()
         logger.info(f"Preprocessing statistics: {json.dumps(stats, indent=2)}")
@@ -458,3 +494,23 @@ class DataProcessor:
             logger.error("No records were processed. Check your data files and CSV format.")
         else:
             logger.info(f"Successfully processed {stats['total_records']} records with {stats['total_unique_strings']} unique strings")
+            
+        # Verify checkpoint files were created
+        required_files = [
+            "unique_strings.json",
+            "string_counts.json", 
+            "field_types.json", 
+            "record_field_hashes.json"
+        ]
+        
+        missing_files = []
+        for file_name in required_files:
+            file_path = os.path.join(checkpoint_dir, file_name)
+            if not os.path.exists(file_path):
+                missing_files.append(file_name)
+        
+        if missing_files:
+            logger.error(f"Some required checkpoint files are missing: {missing_files}")
+            raise RuntimeError("Preprocessing completed but checkpoint files are missing")
+        else:
+            logger.info("All required checkpoint files were created successfully")

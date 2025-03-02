@@ -16,7 +16,7 @@ index_entity_maps: true       # Whether to index entity-to-string maps
 # Checkpointing and caching
 checkpoint_dir: "checkpoints"
 checkpoint_frequency: 10      # Save checkpoints after processing this many files
-use_cached_embeddings: true
+use_cached_embeddings: false
 enable_checkpointing: true
 checkpoint_after_stage: true
 force_rerun: false            # Force rerun of completed stages
