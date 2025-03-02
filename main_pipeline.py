@@ -1121,28 +1121,106 @@ class EntityResolutionPipeline:
         """
         logger.info("Indexing string data in Weaviate")
         
+        # First, connect to Weaviate
+        if not self.weaviate_manager.connect():
+            logger.error("Failed to connect to Weaviate")
+            raise RuntimeError("Cannot connect to Weaviate")
+        
         # If required, clear existing data
         if self.config.get("clear_existing_data", False):
+            logger.info("Clearing existing data from Weaviate")
             self.weaviate_manager.clear_collections()
         
-        # Prepare string data for indexing
-        unique_strings = self.data_processor.deduplicator.unique_strings
-        string_counts = self.data_processor.deduplicator.string_counts
+        # Load checkpoint data to ensure we have unique strings
+        checkpoint_dir = os.path.join(self.output_dir, "checkpoints")
+        unique_strings_path = os.path.join(checkpoint_dir, "unique_strings.json")
         
-        logger.info(f"Prepared {len(unique_strings)} unique strings for indexing")
+        if not os.path.exists(unique_strings_path):
+            logger.error(f"Unique strings file not found: {unique_strings_path}")
+            raise FileNotFoundError(f"Unique strings file not found: {unique_strings_path}")
         
-        # Get field type mapping (hash -> field type)
-        field_types = self.data_processor.deduplicator.field_types
+        # Load unique strings directly
+        try:
+            logger.info(f"Loading unique strings from: {unique_strings_path}")
+            with open(unique_strings_path, 'r') as f:
+                unique_strings = json.load(f)
+            logger.info(f"Loaded {len(unique_strings)} unique strings")
+        except Exception as e:
+            logger.error(f"Error loading unique strings: {str(e)}")
+            raise RuntimeError(f"Failed to load unique strings: {str(e)}")
         
-        # Ensure all strings have field types (fallback to field mappings if needed)
-        if len(field_types) < len(unique_strings):
-            logger.warning(f"Field types incomplete ({len(field_types)} vs {len(unique_strings)} strings), generating missing mappings")
-            for record_id, field_hash_map in self.data_processor.deduplicator.record_field_hashes.items():
-                for field, hash_value in field_hash_map.items():
-                    if hash_value != "NULL" and hash_value not in field_types:
-                        field_types[hash_value] = field
+        # Load string counts and field types
+        string_counts_path = os.path.join(checkpoint_dir, "string_counts.json")
+        field_types_path = os.path.join(checkpoint_dir, "field_types.json")
         
-        logger.info(f"Using {len(field_types)} field type mappings")
+        string_counts = {}
+        field_types = {}
+        
+        try:
+            if os.path.exists(string_counts_path):
+                with open(string_counts_path, 'r') as f:
+                    string_counts = json.load(f)
+                logger.info(f"Loaded {len(string_counts)} string counts")
+            else:
+                # Generate default counts (all 1) if file doesn't exist
+                logger.warning("String counts file not found, using default counts")
+                string_counts = {hash_key: 1 for hash_key in unique_strings.keys()}
+            
+            if os.path.exists(field_types_path):
+                with open(field_types_path, 'r') as f:
+                    field_types = json.load(f)
+                logger.info(f"Loaded {len(field_types)} field types")
+            else:
+                # Generate field types from the first field type in record_field_hashes
+                logger.warning("Field types file not found, will be inferred")
+                record_hashes_path = os.path.join(checkpoint_dir, "record_field_hashes.json")
+                
+                if os.path.exists(record_hashes_path):
+                    with open(record_hashes_path, 'r') as f:
+                        record_hashes = json.load(f)
+                    
+                    # Map hashes to field types
+                    for record_id, fields in record_hashes.items():
+                        for field, hash_value in fields.items():
+                            if hash_value != "NULL" and hash_value not in field_types:
+                                field_types[hash_value] = field
+                    
+                    logger.info(f"Inferred {len(field_types)} field types from record hashes")
+                else:
+                    # Default to "unknown" field type
+                    field_types = {hash_key: "unknown" for hash_key in unique_strings.keys()}
+                    logger.warning("Record hashes file not found, using 'unknown' field type")
+        except Exception as e:
+            logger.error(f"Error loading supporting files: {str(e)}")
+            logger.warning("Continuing with default values")
+        
+        # Load embeddings
+        embedding_cache = os.path.join(self.output_dir, "embeddings.npz")
+        if not os.path.exists(embedding_cache):
+            logger.error(f"Embeddings file not found: {embedding_cache}")
+            raise FileNotFoundError(f"Embeddings file not found: {embedding_cache}")
+        
+        logger.info(f"Loading embeddings from: {embedding_cache}")
+        if not self.embedding_generator.load_embeddings(embedding_cache):
+            logger.error("Failed to load embeddings")
+            raise RuntimeError("Failed to load embeddings")
+        
+        logger.info(f"Loaded {len(self.embedding_generator.embeddings)} embeddings")
+        
+        # Ensure embeddings exist for all unique strings
+        missing_embeddings = [hash_key for hash_key in unique_strings.keys() 
+                            if hash_key not in self.embedding_generator.embeddings]
+        
+        if missing_embeddings:
+            logger.error(f"Missing embeddings for {len(missing_embeddings)} unique strings")
+            if len(missing_embeddings) <= 10:
+                logger.error(f"Missing embeddings for: {missing_embeddings}")
+            else:
+                logger.error(f"First 10 missing embeddings: {missing_embeddings[:10]}")
+            raise RuntimeError("Not all unique strings have embeddings. Run embedding stage first.")
+        
+        # Prepare for indexing
+        logger.info(f"Preparing {len(unique_strings)} unique strings for indexing")
         
         # Index unique strings with their vectors
         success = self.weaviate_manager.index_unique_strings(
@@ -1156,38 +1234,74 @@ class EntityResolutionPipeline:
             logger.error("Failed to index unique strings in Weaviate")
             raise RuntimeError("String indexing failed")
         
+        # Load record field hashes to prepare entity maps
+        record_hashes_path = os.path.join(checkpoint_dir, "record_field_hashes.json")
+        if not os.path.exists(record_hashes_path):
+            logger.error(f"Record hashes file not found: {record_hashes_path}")
+            raise FileNotFoundError(f"Record hashes file not found: {record_hashes_path}")
+        
+        try:
+            with open(record_hashes_path, 'r') as f:
+                record_field_hashes = json.load(f)
+            logger.info(f"Loaded {len(record_field_hashes)} record field hashes")
+        except Exception as e:
+            logger.error(f"Error loading record field hashes: {str(e)}")
+            raise RuntimeError(f"Failed to load record field hashes: {str(e)}")
+        
         # Prepare entity maps
         entity_maps = []
-        for record_id, field_hashes in self.data_processor.deduplicator.record_field_hashes.items():
+        max_records = self.config.get("max_records")
+        
+        for record_id, field_hashes in record_field_hashes.items():
             person_name = ""
             person_hash = field_hashes.get("person")
             if person_hash != "NULL":
                 person_name = unique_strings.get(person_hash, "")
-                
+                    
             entity_maps.append({
                 "entity_id": record_id,
                 "field_hashes": field_hashes,
                 "person_name": person_name
             })
-            
+                
             # Limit number of entities in development mode
-            max_records = self.config.get("max_records")
             if max_records and len(entity_maps) >= max_records:
                 logger.info(f"Reached maximum records limit: {max_records}")
                 break
         
         # Index entity maps (optional)
         if self.config.get("index_entity_maps", True):
+            logger.info(f"Indexing {len(entity_maps)} entity maps")
             success = self.weaviate_manager.index_entity_maps(entity_maps)
             if not success:
                 logger.warning("Failed to index entity maps (non-critical)")
+        
+        # Retrieve field vectors for all records
+        logger.info("Retrieving field vectors for records")
+        records_to_process = {}
+        for record_id, field_hashes in record_field_hashes.items():
+            # Apply record limit
+            if max_records and len(records_to_process) >= max_records:
+                break
+                    
+            records_to_process[record_id] = field_hashes
+        
+        # Batch retrieve field vectors
+        logger.info(f"Retrieving vectors for {len(records_to_process)} records")
+        self.record_embeddings = self.weaviate_manager.get_field_vectors_for_records(records_to_process)
+        
+        # Save retrieved embeddings for later use
+        self._save_record_embeddings()
         
         # Save stats
         self.stats["string_indexing"] = {
             "unique_strings_indexed": len(unique_strings),
             "entity_maps_indexed": len(entity_maps),
-            "field_types_mapped": len(field_types)
+            "field_types_mapped": len(field_types),
+            "records_processed": len(self.record_embeddings)
         }
+        
+        logger.info(f"String indexing complete: {len(unique_strings)} unique strings indexed")
     
     def _prepare_training_data_wrapper(self) -> Tuple[Dict, Dict, List]:
         """

@@ -191,11 +191,26 @@ class WeaviateManager:
         if not self.client:
             logger.error("Not connected to Weaviate")
             return False
-            
+                
         try:
             # Check if collections already exist
+            logger.info("Retrieving existing collections from Weaviate")
             existing_collections = self.client.collections.list_all()
-            existing_names = [c.name for c in existing_collections]
+            
+            # Handle different return types based on Weaviate client version
+            if isinstance(existing_collections, list):
+                # In newer versions, this might be a list of Collection objects
+                try:
+                    existing_names = [c.name for c in existing_collections]
+                    logger.info(f"Found existing collections: {existing_names}")
+                except AttributeError:
+                    # If the items don't have name attribute, they might be strings
+                    existing_names = existing_collections
+                    logger.info(f"Found existing collections (string format): {existing_names}")
+            else:
+                # In some versions, this might be something else
+                logger.warning(f"Unexpected type for collections list: {type(existing_collections)}")
+                existing_names = []
             
             # Get vector index configuration based on environment
             hnsw_config = self._get_vector_index_config()
@@ -211,7 +226,7 @@ class WeaviateManager:
                     properties=self.unique_strings_properties,
                     vector_index_config=hnsw_config
                 )
-                
+                    
                 logger.info("Created collection: UniqueStrings")
             else:
                 logger.info("Collection already exists: UniqueStrings")
@@ -226,13 +241,13 @@ class WeaviateManager:
                     vectorizer_config=Configure.Vectorizer.none(),  # No vectors needed
                     properties=self.entity_map_properties
                 )
-                
+                    
                 logger.info("Created collection: EntityMap")
             else:
                 logger.info("Collection already exists: EntityMap")
             
             return True
-            
+                
         except Exception as e:
             logger.error(f"Error setting up collections: {str(e)}")
             import traceback
