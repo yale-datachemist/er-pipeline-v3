@@ -1,0 +1,150 @@
+# Entity Resolution Pipeline Configuration
+
+# General settings
+mode: "dev"  # "dev" for development mode, "production" for full dataset
+output_dir: "output"
+data_dir: "data"
+dev_data_dir: "dev_data"
+
+# Checkpointing and caching
+checkpoint_dir: "checkpoints"
+checkpoint_frequency: 10  # Save checkpoints after processing this many files
+use_cached_embeddings: true
+enable_checkpointing: true
+checkpoint_after_stage: true
+force_rerun: false       # Force rerun of completed stages
+
+# Dataset limits
+max_records: 10000  # Limit for development mode, set to null for production
+
+# Preprocessing settings
+ground_truth_file: "data/ground_truth.csv"
+
+# OpenAI API settings
+openai_api_key: "your-openai-api-key"
+embedding_model: "text-embedding-3-small"
+
+# OpenAI rate limits
+requests_per_minute: 10000
+tokens_per_minute: 5000000
+daily_token_limit: 500000000
+
+# Embedding generation settings
+embedding_batch_size: 50
+embedding_workers: 4
+max_retries: 5
+retry_delay: 1
+
+# Weaviate settings
+weaviate_url: "http://localhost:8080"
+weaviate_batch_size: 100
+weaviate_retry_count: 3
+
+# Feature engineering settings
+field_weights:
+  person: 1.0
+  roles: 0.7
+  title: 0.9
+  attribution: 0.8
+  provision: 0.6
+  subjects: 0.7
+  genres: 0.5
+  relatedWork: 0.6
+  record: 0.8
+
+# Classifier settings
+learning_rate: 0.01
+max_iterations: 1000
+tolerance: 0.0001
+l2_regularization: 0.01
+grad_clip_threshold: 5.0
+
+# Imputation settings
+imputation_neighbors: 10
+
+# Clustering settings
+match_threshold: 0.7
+min_cluster_size: 2
+max_neighbors: 50
+graph_batch_size: 1000  # Records per batch for graph building
+
+# LLM fallback settings
+use_llm_fallback: true
+llm_model: "gpt-4o"
+max_llm_requests: 100  # Limit number of LLM API calls
+
+# Environment-specific scaling parameters
+environment:
+  # Development environment (8 cores, 32GB RAM)
+  development:
+    parallelism: 4
+    batch_sizes:
+      embedding: 50
+      weaviate: 100
+      graph: 1000
+    memory_limits:
+      max_records_in_memory: 10000
+      max_vectors_per_batch: 5000
+    weaviate_resources:
+      mem_limit: "16Gi"
+      cpu_limit: "4"
+    vector_index_params:
+      ef_construction: 128
+      ef: 128
+      max_connections: 64
+
+  # Production environment (64 cores, 256GB RAM)
+  production:
+    parallelism: 32
+    batch_sizes:
+      embedding: 200
+      weaviate: 1000
+      graph: 10000
+    memory_limits:
+      max_records_in_memory: 100000
+      max_vectors_per_batch: 50000
+    weaviate_resources:
+      mem_limit: "128Gi"
+      cpu_limit: "32"
+    vector_index_params:
+      ef_construction: 256
+      ef: 256
+      max_connections: 128
+
+# Field-specific weights based on presence and imputation status
+field_presence_weights:
+  attribution:
+    both_present: 1.2
+    both_absent: 0.8
+    one_present: 0.5
+    first_present_second_imputed: 0.7
+    first_imputed_second_present: 0.7
+    both_imputed: 0.4
+  provision:
+    both_present: 1.5
+    both_absent: 0.7
+    one_present: 0.4
+    first_present_second_imputed: 0.6
+    first_imputed_second_present: 0.6
+    both_imputed: 0.3
+  subjects:
+    both_present: 1.3
+    both_absent: 0.9
+    one_present: 0.6
+    first_present_second_imputed: 0.8
+    first_imputed_second_present: 0.8
+    both_imputed: 0.5
+  genres:
+    both_present: 1.1
+    both_absent: 0.9
+    one_present: 0.7
+    first_present_second_imputed: 0.8
+    first_imputed_second_present: 0.8
+    both_imputed: 0.6
+  relatedWork:
+    both_present: 1.4
+    both_absent: 0.8
+    one_present: 0.6
+    first_present_second_imputed: 0.9
+    first_imputed_second_present: 0.9
+    both_imputed: 0.5
