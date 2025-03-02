@@ -1117,6 +1117,61 @@ class EntityResolutionPipeline:
         logger.info("Completed training data preparation")
         return result
 
+    def check_openai_api_key(self) -> bool:
+        """
+        Check if a valid OpenAI API key is available.
+        
+        Returns:
+            bool: True if API key is valid, False otherwise
+        """
+        logger.info("Checking OpenAI API key")
+        
+        # First, look in config
+        api_key = self.config.get("openai_api_key")
+        
+        # If not in config, check environment variable
+        if not api_key or api_key == "your-openai-api-key":
+            import os
+            api_key = os.environ.get("OPENAI_API_KEY")
+            
+            if api_key:
+                logger.info("Using OpenAI API key from environment variable")
+                # Update config to use the key from environment
+                self.config["openai_api_key"] = api_key
+        
+        # Validate the key (basic validation)
+        if not api_key:
+            logger.error("No OpenAI API key found in config or environment variables")
+            return False
+            
+        if api_key == "your-openai-api-key" or len(api_key) < 10:
+            logger.error("Invalid OpenAI API key. Please set a valid API key.")
+            return False
+        
+        # If the embedding generator is already initialized, update its client's API key
+        if hasattr(self, 'embedding_generator') and self.embedding_generator:
+            try:
+                self.embedding_generator.client.api_key = api_key
+                logger.info("Updated embedding generator with API key")
+            except Exception as e:
+                logger.warning(f"Could not update embedding generator client: {e}")
+        
+        # Do a test API call to verify key works
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            # Try a very small models call just to validate the key
+            response = client.embeddings.create(
+                model="text-embedding-3-small",
+                input="test",
+                encoding_format="float"
+            )
+            logger.info("Successfully verified OpenAI API key with a test call")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to verify OpenAI API key: {e}")
+            return False
+
     def _retrieve_vectors_for_training(self, ground_truth_pairs: List[Tuple[str, str, bool]]) -> None:
         """
         Retrieve vectors specifically for the training dataset.

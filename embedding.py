@@ -166,51 +166,75 @@ class EmbeddingGenerator:
         logger.error(f"Failed to generate embeddings after {self.max_retries} attempts")
         return [], []
     
-    def generate_embeddings(self, texts: List[str], text_ids: List[str] = None) -> Dict[str, List[float]]:
+    def generate_embeddings(self) -> None:
         """
-        Generate embeddings for a list of texts.
-        
-        Args:
-            texts: List of text strings to embed
-            text_ids: Optional list of IDs for the texts
-            
-        Returns:
-            Dictionary mapping text IDs (or hashes) to embeddings
+        Generate embeddings for unique strings.
         """
-        if not texts:
-            return {}
+        logger.info("Starting embedding generation")
+        
+        # Check if we have unique strings to embed
+        if not hasattr(self.data_processor, 'deduplicator') or not self.data_processor.deduplicator.unique_strings:
+            logger.error("No unique strings found to generate embeddings. Run preprocessing stage first.")
+            raise RuntimeError("No data available for embedding generation. Run preprocessing first.")
+        
+        # Log the number of unique strings to embed
+        unique_strings = self.data_processor.deduplicator.unique_strings
+        logger.info(f"Found {len(unique_strings)} unique strings to embed")
+        
+        # Try to load from cache first
+        embedding_cache = os.path.join(self.output_dir, "embeddings.npz")
+        cache_loaded = False
+        
+        if os.path.exists(embedding_cache) and self.config.get("use_cached_embeddings", True):
+            logger.info(f"Loading embeddings from cache: {embedding_cache}")
+            cache_loaded = self.embedding_generator.load_embeddings(embedding_cache)
+            logger.info(f"Loaded {len(self.embedding_generator.embeddings)} embeddings from cache")
+        
+        # Check if we loaded enough embeddings or need to generate more
+        missing_strings = []
+        for hash_key, string_value in unique_strings.items():
+            if hash_key not in self.embedding_generator.embeddings:
+                missing_strings.append((hash_key, string_value))
+        
+        if missing_strings:
+            logger.info(f"Need to generate embeddings for {len(missing_strings)} strings missing from cache")
             
-        # If no text_ids provided, use indices as IDs
-        if text_ids is None:
-            text_ids = [str(i) for i in range(len(texts))]
-        
-        # Create batches
-        batches = []
-        batch_ids = []
-        
-        for i in range(0, len(texts), self.batch_size):
-            batch = texts[i:i+self.batch_size]
-            ids = text_ids[i:i+self.batch_size]
-            batches.append(batch)
-            batch_ids.append(ids)
-        
-        # Process batches
-        result_dict = {}
-        
-        for batch, ids in tqdm(zip(batches, batch_ids), total=len(batches), desc="Generating embeddings"):
-            text_hashes, embeddings = self._generate_embedding_batch(batch)
+            # Check OpenAI API key
+            api_key = self.config.get("openai_api_key")
+            if not api_key or api_key == "your-openai-api-key":
+                logger.error("No valid OpenAI API key found in config. Please add your API key.")
+                raise ValueError("Missing OpenAI API key in configuration")
             
-            if len(text_hashes) != len(embeddings):
-                logger.warning("Mismatched lengths between hashes and embeddings")
-                continue
-                
-            # Store embeddings with their IDs
-            for text_id, embedding in zip(ids, embeddings):
-                result_dict[text_id] = embedding
-                # Also store in instance variable for persistence
-                self.embeddings[text_id] = embedding
+            # Create a dictionary for missing strings
+            missing_dict = {hash_key: string_value for hash_key, string_value in missing_strings}
+            
+            # Generate new embeddings
+            logger.info(f"Generating embeddings using OpenAI API ({self.config.get('embedding_model', 'text-embedding-3-small')})")
+            try:
+                new_embeddings = self.embedding_generator.generate_embeddings_for_unique_strings(missing_dict)
+                logger.info(f"Successfully generated {len(new_embeddings)} new embeddings")
+            except Exception as e:
+                logger.error(f"Error generating embeddings: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                raise
+            
+            # Save updated embeddings
+            self.embedding_generator.save_embeddings(embedding_cache)
+        elif not self.embedding_generator.embeddings:
+            logger.warning("No embeddings loaded from cache and no new strings to embed")
+        else:
+            logger.info("All strings already have embeddings in cache, no need to generate new ones")
         
-        return result_dict
+        # Save stats
+        self.stats["embeddings"] = {
+            "total_embeddings": len(self.embedding_generator.embeddings),
+            "unique_strings": len(unique_strings),
+            "loaded_from_cache": cache_loaded,
+            "newly_generated": len(missing_strings) if missing_strings else 0
+        }
+        
+        logger.info(f"Embedding generation complete: {len(self.embedding_generator.embeddings)} total embeddings available")
     
     def generate_embeddings_for_unique_strings(self, unique_strings: Dict[str, str]) -> Dict[str, List[float]]:
         """

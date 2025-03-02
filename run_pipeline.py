@@ -92,6 +92,9 @@ def parse_args():
     
     parser.add_argument('--skip_preprocessing', action='store_true',
                         help='Skip preprocessing stage and use cached data')
+                        
+    parser.add_argument('--skip_embedding', action='store_true',
+                        help='Skip embedding generation and only use cached embeddings')
     
     parser.add_argument('--max_records', type=int, default=None,
                         help='Maximum number of records to process')
@@ -246,23 +249,41 @@ def main():
         # Override configuration settings from command line
         if args.mode:
             pipeline_instance.config['mode'] = args.mode
+            logger.info(f"Using mode: {args.mode}")
         
         if args.weaviate_url:
             pipeline_instance.config['weaviate_url'] = args.weaviate_url
         
         if args.max_records:
             pipeline_instance.config['max_records'] = args.max_records
+            logger.info(f"Using max records: {args.max_records}")
         
         if args.output_dir:
             pipeline_instance.config['output_dir'] = args.output_dir
             pipeline_instance.output_dir = args.output_dir
             os.makedirs(pipeline_instance.output_dir, exist_ok=True)
+            logger.info(f"Using output directory: {args.output_dir}")
         
         if args.force_rerun:
             pipeline_instance.config['force_rerun'] = True
+            logger.info("Force rerun enabled")
         
         if args.openai_api_key:
             pipeline_instance.config['openai_api_key'] = args.openai_api_key
+            logger.info("Using OpenAI API key from command line")
+        
+        # For embedding stage, check API key
+        if args.stage == 'embed' or args.stage == 'all':
+            # Check if embedding is actually needed 
+            if not args.skip_embedding:
+                if not pipeline_instance.check_openai_api_key():
+                    logger.error("Cannot proceed with embedding without a valid OpenAI API key")
+                    print("\nError: No valid OpenAI API key found!")
+                    print("Please provide your key in one of these ways:")
+                    print("1. Set it in your config.yml file")
+                    print("2. Use the --openai_api_key parameter")
+                    print("3. Set the OPENAI_API_KEY environment variable")
+                    sys.exit(1)
         
         # Check disable_cleanup flag
         if args.disable_cleanup:
@@ -284,7 +305,11 @@ def main():
             else:
                 pipeline_instance.preprocess_data()
             
-            pipeline_instance.generate_embeddings()
+            if args.skip_embedding:
+                logger.info("Skipping embedding generation, using cached data")
+            else:
+                pipeline_instance.generate_embeddings()
+            
             pipeline_instance.setup_weaviate()
             pipeline_instance.index_strings()
             
@@ -300,7 +325,10 @@ def main():
             
         elif args.stage == 'embed':
             # Run only embedding generation
-            pipeline_instance.generate_embeddings()
+            if args.skip_embedding:
+                logger.info("Skipping embedding generation, using cached data")
+            else:
+                pipeline_instance.generate_embeddings()
             
         elif args.stage == 'index':
             # Run setup and indexing
@@ -334,6 +362,7 @@ def main():
         # If cleanup is not disabled, ensure it runs even if there was an error
         if not args.disable_cleanup:
             cleanup_handler()
+
 
 if __name__ == "__main__":
     try:
