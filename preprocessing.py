@@ -26,6 +26,9 @@ class TextDeduplicator:
             config: Dictionary containing configuration parameters
         """
         self.config = config
+        # Get CSV delimiter from config
+        self.csv_delimiter = config.get("csv_delimiter", ",")
+        
         # Fields to deduplicate and embed
         self.embed_fields = [
             'record', 'person', 'roles', 'title', 'attribution', 
@@ -42,6 +45,10 @@ class TextDeduplicator:
         self.field_types: Dict[str, str] = {}  # hash -> field_type
         # Map record_id to field hashes
         self.record_field_hashes: Dict[str, Dict[str, str]] = {}  # record_id -> {field -> hash}
+        
+        # Enable verbose logging based on config
+        self.verbose_logging = config.get("verbose_logging", False)
+        self.log_csv_parsing = config.get("log_csv_parsing", False)
         
     def _hash_text(self, text: str) -> str:
         """
@@ -112,8 +119,8 @@ class TextDeduplicator:
         logger.info(f"Processing file: {file_path}")
         
         try:
-            # Add error handling for CSV parsing with on_bad_lines parameter
-            df = pd.read_csv(file_path, sep='\t', dtype=str, on_bad_lines='warn')
+            # Changed delimiter from tab to comma
+            df = pd.read_csv(file_path, sep=',', dtype=str, on_bad_lines='warn')
             processed_records = []
             
             for _, row in df.iterrows():
@@ -147,20 +154,33 @@ class TextDeduplicator:
         """
         logger.info(f"Processing directory: {directory}")
         
+        # Check if directory exists
+        if not os.path.exists(directory):
+            logger.error(f"Directory does not exist: {directory}")
+            return
+            
+        # Log the files found
+        csv_files = [f for f in os.listdir(directory) if f.endswith('.csv')]
+        logger.info(f"Found {len(csv_files)} CSV files in {directory}: {csv_files}")
+        
+        if not csv_files:
+            logger.warning(f"No CSV files found in directory: {directory}")
+            return
+        
         files_processed = 0
         records_processed = 0
         
-        for file_name in os.listdir(directory):
-            if file_name.endswith('.csv'):
-                file_path = os.path.join(directory, file_name)
-                processed_records = self.process_file(file_path)
-                
-                files_processed += 1
-                records_processed += len(processed_records)
-                
-                # Save checkpoint if configured
-                if files_processed % self.config.get("checkpoint_frequency", 50) == 0:
-                    self.save_checkpoint()
+        for file_name in csv_files:
+            file_path = os.path.join(directory, file_name)
+            processed_records = self.process_file(file_path)
+            
+            files_processed += 1
+            records_processed += len(processed_records)
+            
+            # Save checkpoint if configured
+            if files_processed % self.config.get("checkpoint_frequency", 50) == 0:
+                self.save_checkpoint()
+                logger.info(f"Progress: {files_processed}/{len(csv_files)} files processed")
         
         logger.info(f"Completed processing {files_processed} files with {records_processed} records")
         self.save_checkpoint()
@@ -332,21 +352,57 @@ class DataProcessor:
             List of tuples (left_id, right_id, is_match)
         """
         try:
+            logger.info(f"Parsing ground truth file: {ground_truth_file}")
+            
+            if not os.path.exists(ground_truth_file):
+                logger.error(f"Ground truth file does not exist: {ground_truth_file}")
+                return []
+                
+            # Read with automatic delimiter detection
             df = pd.read_csv(ground_truth_file)
+            
+            # Log column names to help debugging
+            logger.info(f"Ground truth columns: {df.columns.tolist()}")
+            
+            # Check required columns
+            required_columns = ['left', 'right', 'match']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                logger.error(f"Missing required columns in ground truth file: {missing_columns}")
+                return []
             
             # Convert to list of tuples
             ground_truth = []
             for _, row in df.iterrows():
                 left_id = row['left']
                 right_id = row['right']
-                is_match = str(row['match']).lower() == 'true'
-                ground_truth.append((left_id, right_id, is_match))
                 
-            logger.info(f"Parsed {len(ground_truth)} ground truth pairs")
+                # Handle different formats of truth values
+                if isinstance(row['match'], bool):
+                    is_match = row['match']
+                elif isinstance(row['match'], str):
+                    is_match = row['match'].lower() in ('true', 'yes', '1', 't')
+                elif isinstance(row['match'], (int, float)):
+                    is_match = bool(row['match'])
+                else:
+                    is_match = False
+                    
+                ground_truth.append((left_id, right_id, is_match))
+                    
+            # Log statistics for debugging
+            match_count = sum(1 for _, _, is_match in ground_truth if is_match)
+            non_match_count = len(ground_truth) - match_count
+            
+            logger.info(f"Parsed {len(ground_truth)} ground truth pairs: "
+                    f"{match_count} matches, {non_match_count} non-matches")
+            
             return ground_truth
             
         except Exception as e:
             logger.error(f"Error parsing ground truth file: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
     
     def run_preprocessing(self, mode: str = "full") -> None:
@@ -356,15 +412,49 @@ class DataProcessor:
         Args:
             mode: 'full' for production or 'dev' for development mode
         """
+        logger.info(f"Running preprocessing in {mode} mode")
+        
+        # Get CSV delimiter from config
+        csv_delimiter = self.config.get("csv_delimiter", ",")
+        logger.info(f"Using CSV delimiter: '{csv_delimiter}'")
+        
+        # Set the delimiter in the deduplicator
+        self.deduplicator.csv_delimiter = csv_delimiter
+        
         if mode == "dev":
             # For development mode, create subset and process it
             data_dir = self.config.get("data_dir")
-            self.prepare_development_subset(data_dir)
-            self.deduplicator.process_directory(self.config.get("dev_data_dir", "dev_data"))
+            logger.info(f"Creating development subset from {data_dir}")
+            
+            if not os.path.exists(data_dir):
+                logger.error(f"Data directory does not exist: {data_dir}")
+                return
+            
+            max_records = self.config.get("max_records", 10000)
+            self.prepare_development_subset(data_dir, max_records)
+            
+            # Process the development subset
+            dev_data_dir = self.config.get("dev_data_dir", "dev_data")
+            if not os.path.exists(dev_data_dir):
+                logger.warning(f"Development data directory does not exist: {dev_data_dir}")
+                os.makedirs(dev_data_dir, exist_ok=True)
+                
+            self.deduplicator.process_directory(dev_data_dir)
         else:
             # For full mode, process all data
-            self.deduplicator.process_directory(self.config.get("data_dir"))
+            data_dir = self.config.get("data_dir")
+            if not os.path.exists(data_dir):
+                logger.error(f"Data directory does not exist: {data_dir}")
+                return
+                
+            self.deduplicator.process_directory(data_dir)
         
         # Print statistics
         stats = self.deduplicator.get_statistics()
         logger.info(f"Preprocessing statistics: {json.dumps(stats, indent=2)}")
+        
+        # Check if we processed any records
+        if stats["total_records"] == 0:
+            logger.error("No records were processed. Check your data files and CSV format.")
+        else:
+            logger.info(f"Successfully processed {stats['total_records']} records with {stats['total_unique_strings']} unique strings")

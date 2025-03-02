@@ -374,56 +374,150 @@ class FeatureEngineer:
         
         return feature_vector, feature_names
     
-    def prepare_training_data(self, pairs: List[Tuple[Dict, Dict, bool]], 
-                             embeddings_map: Dict[str, Dict[str, List[float]]]) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    def prepare_training_data(self) -> Tuple[Dict[str, Dict], Dict[str, Dict], List[Tuple]]:
         """
-        Prepare training data from pairs of records.
+        Prepare data for classifier training, separate from the full dataset classification.
         
-        Args:
-            pairs: List of (record1, record2, is_match) tuples
-            embeddings_map: Map of record IDs to field embeddings
-            
         Returns:
-            Tuple of (X, y, feature_names)
+            Tuple of (train_records, test_records, ground_truth_pairs)
         """
-        features_list = []
-        labels = []
-        feature_names = None
+        logger.info("Preparing training data")
         
-        for record1, record2, is_match in tqdm(pairs, desc="Generating features"):
-            record1_id = record1.get("id")
-            record2_id = record2.get("id")
-            
-            # Skip if embeddings not available
-            if record1_id not in embeddings_map or record2_id not in embeddings_map:
-                logger.warning(f"Embeddings not found for records: {record1_id} or {record2_id}")
-                continue
-                
-            # Generate features
-            features = self.generate_features(
-                record1, record2,
-                embeddings_map[record1_id], embeddings_map[record2_id]
+        # Parse ground truth file
+        ground_truth_file = self.config.get("ground_truth_file")
+        ground_truth_pairs = self.data_processor.parse_ground_truth(ground_truth_file)
+        
+        if not ground_truth_pairs:
+            logger.error("No ground truth pairs found or could not be parsed")
+            return {}, {}, []
+        
+        # Initialize imputer for training data
+        training_imputer = NullValueImputer(self.config, self.weaviate_manager)
+        
+        # Collect records for training
+        all_records = {}
+        missing_records = []
+        
+        for left_id, right_id, _ in ground_truth_pairs:
+            # Get record hashes
+            for record_id in [left_id, right_id]:
+                if record_id not in all_records:
+                    if record_id in self.data_processor.deduplicator.record_field_hashes:
+                        field_hashes = self.data_processor.deduplicator.record_field_hashes[record_id]
+                        
+                        # Reconstruct record from field hashes
+                        record = self._reconstruct_record_from_hashes(record_id, field_hashes)
+                        
+                        if record:
+                            # Apply imputation if needed
+                            if record_id in self.record_embeddings:
+                                record_embeddings = self.record_embeddings[record_id]
+                                for field in training_imputer.imputable_fields:
+                                    if not record.get(field) or pd.isna(record.get(field)):
+                                        record = training_imputer.impute_null_fields(record, record_embeddings)
+                                        break
+                            
+                            all_records[record_id] = record
+                        else:
+                            missing_records.append(record_id)
+                    else:
+                        missing_records.append(record_id)
+        
+        if missing_records:
+            logger.warning(f"Could not find {len(missing_records)} records from ground truth in processed data")
+            if len(missing_records) <= 10:
+                logger.warning(f"Missing record IDs: {missing_records}")
+            else:
+                logger.warning(f"First 10 missing record IDs: {missing_records[:10]}...")
+        
+        if not all_records:
+            logger.error("No valid records found for training")
+            return {}, {}, []
+        
+        logger.info(f"Collected {len(all_records)} records for training out of {len(set([id for pair in ground_truth_pairs for id in pair[:2]]))} unique IDs in ground truth")
+        
+        # Check if we have enough records for a meaningful split
+        if len(all_records) < 10:
+            logger.warning("Very few records available for training, results may be unreliable")
+        
+        # Create train/test split
+        from sklearn.model_selection import train_test_split
+        
+        # Filter ground truth to only include records we have
+        valid_ground_truth = [(left, right, match) for left, right, match in ground_truth_pairs 
+                            if left in all_records and right in all_records]
+        
+        if not valid_ground_truth:
+            logger.error("No valid ground truth pairs remain after filtering")
+            return {}, {}, []
+        
+        logger.info(f"Using {len(valid_ground_truth)} valid ground truth pairs for training/testing")
+        
+        # Prepare stratification labels
+        stratify_labels = [int(is_match) for _, _, is_match in valid_ground_truth]
+        
+        try:
+            train_pairs, test_pairs = train_test_split(
+                valid_ground_truth,
+                test_size=0.2,
+                random_state=42,
+                stratify=stratify_labels
             )
-            
-            # Vectorize
-            feature_vector, names = self.vectorize_features(features)
-            
-            # Store for training
-            features_list.append(feature_vector)
-            labels.append(1 if is_match else 0)
-            
-            # Store feature names (first time only)
-            if feature_names is None:
-                feature_names = names
+        except ValueError as e:
+            logger.warning(f"Error in train/test split: {str(e)}")
+            logger.warning("Falling back to simple random split without stratification")
+            train_pairs, test_pairs = train_test_split(
+                valid_ground_truth,
+                test_size=0.2,
+                random_state=42
+            )
         
-        # Convert to arrays
-        X = np.vstack(features_list)
-        y = np.array(labels)
+        train_ids = set()
+        for left_id, right_id, _ in train_pairs:
+            train_ids.add(left_id)
+            train_ids.add(right_id)
+            
+        test_ids = set()
+        for left_id, right_id, _ in test_pairs:
+            test_ids.add(left_id)
+            test_ids.add(right_id)
+            
+        train_records = {rid: all_records[rid] for rid in train_ids if rid in all_records}
+        test_records = {rid: all_records[rid] for rid in test_ids if rid in all_records}
         
-        # Scale features
-        X_scaled = self.scaler.fit_transform(X)
+        # Make sure each pair has both records available
+        train_pairs = [(left, right, match) for left, right, match in train_pairs 
+                    if left in train_records and right in train_records]
+        test_pairs = [(left, right, match) for left, right, match in test_pairs 
+                    if left in test_records and right in test_records]
         
-        return X_scaled, y, feature_names
+        logger.info(f"Prepared {len(train_pairs)} training pairs, {len(test_pairs)} test pairs")
+        logger.info(f"Training records: {len(train_records)}, test records: {len(test_records)}")
+        
+        # Check class balance
+        train_positives = sum(1 for _, _, match in train_pairs if match)
+        train_negatives = len(train_pairs) - train_positives
+        test_positives = sum(1 for _, _, match in test_pairs if match)
+        test_negatives = len(test_pairs) - test_positives
+        
+        logger.info(f"Training class balance: {train_positives} positives, {train_negatives} negatives")
+        logger.info(f"Testing class balance: {test_positives} positives, {test_negatives} negatives")
+        
+        # Save stats
+        self.stats["training_data"] = {
+            "train_pairs": len(train_pairs),
+            "test_pairs": len(test_pairs),
+            "train_records": len(train_records),
+            "test_records": len(test_records),
+            "ground_truth_total": len(ground_truth_pairs),
+            "valid_ground_truth": len(valid_ground_truth),
+            "train_positives": train_positives,
+            "train_negatives": train_negatives,
+            "test_positives": test_positives,
+            "test_negatives": test_negatives
+        }
+        
+        return train_records, test_records, valid_ground_truth
     
     def save_scaler(self, file_path: str) -> None:
         """

@@ -67,8 +67,25 @@ class NullValueImputer:
         
         return imputed_record
     
-
+    def impute_field(self, record: Dict, field: str, record_vector: List[float]) -> Optional[str]:
+        """
+        Impute a null field in a record using vector-based hot-deck imputation.
         
+        Args:
+            record: Record dictionary
+            field: Field name to impute
+            record_vector: Vector embedding of the record
+            
+        Returns:
+            Imputed value or None if imputation failed
+        """
+        record_id = record.get("id", "unknown")
+        
+        # Check cache first
+        cache_key = f"{record_id}_{field}"
+        if cache_key in self.imputation_cache:
+            return self.imputation_cache[cache_key]
+            
         if not record_vector:
             logger.warning(f"No record vector available for imputation: {record_id}")
             return None
@@ -76,7 +93,7 @@ class NullValueImputer:
         # Get candidates from vector search
         candidates = self.weaviate_manager.get_imputation_candidates(
             query_vector=record_vector,
-            field=field,
+            field_type=field,
             limit=self.num_neighbors
         )
         
@@ -84,8 +101,15 @@ class NullValueImputer:
             logger.warning(f"No imputation candidates found for {record_id}, field {field}")
             return None
         
+        # Extract text values from candidates
+        candidate_texts = [c.get("text", "") for c in candidates]
+        
         # Simple method: use most common value
-        value_counts = Counter(candidates)
+        from collections import Counter
+        value_counts = Counter(candidate_texts)
+        if not value_counts:
+            return None
+            
         most_common = value_counts.most_common(1)[0][0]
         
         # Store in cache

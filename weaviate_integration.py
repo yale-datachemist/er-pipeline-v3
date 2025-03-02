@@ -1,3 +1,4 @@
+import atexit
 import logging
 import time
 import json
@@ -36,13 +37,13 @@ class WeaviateManager:
         
         self.client = None
         
-        # List of fields that will be embedded
+        # Fields to embed
         self.embedable_fields = [
             "record", "person", "roles", "title", "attribution", 
             "provision", "subjects", "genres", "relatedWork"
         ]
         
-        # Define the collection schema for unique strings
+        # Define the collection schema
         self.unique_strings_properties = [
             Property(
                 name="text",
@@ -69,7 +70,7 @@ class WeaviateManager:
             )
         ]
         
-        # Define the optional entity map schema
+        # Define the entity map schema
         self.entity_map_properties = [
             Property(
                 name="entity_id",
@@ -79,7 +80,7 @@ class WeaviateManager:
             ),
             Property(
                 name="field_hashes_json",
-                data_type=DataType.TEXT,  # Store as JSON string instead of OBJECT
+                data_type=DataType.TEXT,
                 description="JSON string mapping field names to their string hashes"
             ),
             Property(
@@ -88,6 +89,9 @@ class WeaviateManager:
                 description="Person name for this entity"
             )
         ]
+        
+        # Register cleanup handler for program exit
+        atexit.register(self.close)
     
     def connect(self) -> bool:
         """
@@ -96,6 +100,17 @@ class WeaviateManager:
         Returns:
             Boolean indicating success
         """
+        # If already connected, return True
+        if self.client:
+            try:
+                # Try a simple operation to check if connection is still alive
+                meta = self.client.get_meta()
+                logger.info("Using existing Weaviate connection")
+                return True
+            except Exception:
+                # Connection is stale, close it and reconnect
+                self.close()
+                
         for attempt in range(self.retry_count):
             try:
                 # Try different connection methods based on configuration
@@ -124,6 +139,47 @@ class WeaviateManager:
         
         logger.error(f"Failed to connect to Weaviate after {self.retry_count} attempts")
         return False
+    
+    def close(self) -> None:
+        """
+        Close the Weaviate connection and perform cleanup.
+        """
+        if self.client:
+            try:
+                # Close any active batch operations
+                collections = getattr(self.client, 'collections', None)
+                if collections:
+                    collection_list = collections.list_all()
+                    for collection in collection_list:
+                        if hasattr(collection, 'batch') and collection.batch:
+                            try:
+                                collection.batch.close()
+                                logger.info(f"Closed batch for collection: {collection.name}")
+                            except Exception as e:
+                                logger.warning(f"Error closing batch for {collection.name}: {str(e)}")
+                
+                # Close the client connection
+                if hasattr(self.client, 'close'):
+                    self.client.close()
+                    logger.info("Weaviate connection closed")
+                
+                # Also attempt to close using _connection attribute if available
+                if hasattr(self.client, '_connection') and hasattr(self.client._connection, 'close'):
+                    self.client._connection.close()
+                    logger.info("Weaviate low-level connection closed")
+                
+                # Set client to None to indicate it's been closed
+                self.client = None
+            except Exception as e:
+                logger.error(f"Error closing Weaviate connection: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+    
+    def __del__(self):
+        """
+        Destructor to ensure connection is closed when object is garbage collected.
+        """
+        self.close()
     
     def setup_collections(self) -> bool:
         """
@@ -320,7 +376,61 @@ class WeaviateManager:
             import traceback
             logger.error(traceback.format_exc())
             return False
-    
+        
+    def get_record_by_id(self, record_id: str) -> Optional[Dict]:
+        """
+        Get a record by its ID.
+        
+        This reconstructs a record from the entity map and unique strings.
+        
+        Args:
+            record_id: ID of the record to retrieve
+            
+        Returns:
+            Record dictionary or None if not found
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return None
+        
+        try:
+            # First, try to get the entity map for this record ID
+            field_hashes = self.get_entity_field_hashes(record_id)
+            
+            if not field_hashes:
+                logger.warning(f"No entity map found for record ID: {record_id}")
+                return None
+            
+            # Reconstruct the record from its field hashes
+            record = {"id": record_id}
+            
+            # Get the actual string values for each hash
+            for field, hash_value in field_hashes.items():
+                if hash_value == "NULL":
+                    record[field] = None
+                    continue
+                    
+                # Get the string from UniqueStrings collection
+                string_collection = self.client.collections.get("UniqueStrings")
+                string_result = string_collection.query.fetch_objects(
+                    filters=string_collection.query.filter.by_property("hash").equal(hash_value),
+                    limit=1
+                )
+                
+                if string_result.objects:
+                    record[field] = string_result.objects[0].properties.get("text", "")
+                else:
+                    logger.warning(f"No string found for hash {hash_value} (field {field}, record {record_id})")
+                    record[field] = ""
+            
+            return record
+            
+        except Exception as e:
+            logger.error(f"Error retrieving record by ID {record_id}: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None    
+
     def get_entity_field_hashes(self, entity_id: str) -> Optional[Dict[str, str]]:
         """
         Retrieve field hashes for an entity from the EntityMap collection.

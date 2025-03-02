@@ -1,4 +1,11 @@
 .DS_Store
+.env
+__pycache__
+checkpoints
 data
+dev_data
+output
 tmp
 venv
+weaviate_data
+

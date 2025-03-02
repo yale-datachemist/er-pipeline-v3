@@ -508,7 +508,7 @@ class EntityResolutionPipeline:
         return train_records, test_records, ground_truth_pairs
     
     def train_classifier(self, train_records: Dict[str, Dict], test_records: Dict[str, Dict], 
-                        ground_truth_pairs: List[Tuple]) -> None:
+                      ground_truth_pairs: List[Tuple]) -> None:
         """
         Train and evaluate the classifier, and perform clustering on the training data.
         
@@ -519,55 +519,98 @@ class EntityResolutionPipeline:
         """
         logger.info("Training classifier")
         
+        if not train_records or not test_records:
+            logger.error("Training or test records are empty, cannot train classifier")
+            return
+        
         # Create training pairs
         train_pairs = []
         for left_id, right_id, is_match in ground_truth_pairs:
             if left_id in train_records and right_id in train_records:
                 train_pairs.append((train_records[left_id], train_records[right_id], is_match))
         
+        if not train_pairs:
+            logger.error("No valid training pairs available")
+            return
+        
+        logger.info(f"Created {len(train_pairs)} training pairs")
+        
         # Prepare training data
-        X_train, y_train, feature_names = self.feature_engineer.prepare_training_data(
-            train_pairs, self.record_embeddings
-        )
+        try:
+            X_train, y_train, feature_names = self.feature_engineer.prepare_training_data(
+                train_pairs, self.record_embeddings
+            )
+            
+            if len(X_train) == 0 or len(y_train) == 0:
+                logger.error("Feature engineering resulted in empty training data")
+                return
+                
+            logger.info(f"Prepared training data with {len(X_train)} examples and {len(feature_names)} features")
+            
+            # Check class balance in training data
+            pos_count = sum(y_train)
+            neg_count = len(y_train) - pos_count
+            logger.info(f"Training data class balance: {pos_count} positives, {neg_count} negatives")
+            
+            if pos_count == 0 or neg_count == 0:
+                logger.error("Training data has only one class, cannot train classifier")
+                return
         
-        # Train the classifier
-        training_stats = self.classifier.train(X_train, y_train, feature_names)
-        
-        # Save the trained model
-        self.classifier.save_model(os.path.join(self.output_dir, "classifier_model.pkl"))
-        self.feature_engineer.save_scaler(os.path.join(self.output_dir, "feature_scaler.pkl"))
-        
-        # Create test pairs
-        test_pairs = []
-        for left_id, right_id, is_match in ground_truth_pairs:
-            if left_id in test_records and right_id in test_records:
-                test_pairs.append((test_records[left_id], test_records[right_id], is_match))
-        
-        # Prepare test data
-        X_test, y_test, _ = self.feature_engineer.prepare_training_data(
-            test_pairs, self.record_embeddings
-        )
-        
-        # Evaluate on test data
-        evaluation_stats = self.classifier.evaluate(X_test, y_test)
-        
-        logger.info(f"Classifier training complete. Test accuracy: {evaluation_stats['accuracy']:.4f}")
-        
-        # Initialize components needed for clustering (temporary for training data only)
-        self._initialize_components_for_training()
-        
-        # Perform clustering on training data
-        training_clusters = self._cluster_training_data(train_records)
-        
-        # Evaluate clustering against ground truth
-        clustering_evaluation = self._evaluate_training_clusters(training_clusters, ground_truth_pairs)
-        
-        # Save stats
-        self.stats["classifier"] = {
-            "training": training_stats,
-            "evaluation": evaluation_stats,
-            "clustering": clustering_evaluation
-        }
+            # Train the classifier
+            training_stats = self.classifier.train(X_train, y_train, feature_names)
+            
+            # Save the trained model
+            self.classifier.save_model(os.path.join(self.output_dir, "classifier_model.pkl"))
+            self.feature_engineer.save_scaler(os.path.join(self.output_dir, "feature_scaler.pkl"))
+            
+            # Create test pairs
+            test_pairs = []
+            for left_id, right_id, is_match in ground_truth_pairs:
+                if left_id in test_records and right_id in test_records:
+                    test_pairs.append((test_records[left_id], test_records[right_id], is_match))
+            
+            if not test_pairs:
+                logger.warning("No valid test pairs available, skipping evaluation")
+                return
+                
+            logger.info(f"Created {len(test_pairs)} test pairs")
+            
+            # Prepare test data
+            X_test, y_test, _ = self.feature_engineer.prepare_training_data(
+                test_pairs, self.record_embeddings
+            )
+            
+            if len(X_test) == 0 or len(y_test) == 0:
+                logger.warning("Empty test data, skipping evaluation")
+                return
+            
+            # Evaluate on test data
+            evaluation_stats = self.classifier.evaluate(X_test, y_test)
+            
+            logger.info(f"Classifier training complete. Test accuracy: {evaluation_stats['accuracy']:.4f}, " 
+                    f"Precision: {evaluation_stats['precision']:.4f}, "
+                    f"Recall: {evaluation_stats['recall']:.4f}, "
+                    f"F1: {evaluation_stats['f1_score']:.4f}")
+            
+            # Initialize components needed for clustering (temporary for training data only)
+            self._initialize_components_for_training()
+            
+            # Perform clustering on training data
+            training_clusters = self._cluster_training_data(train_records)
+            
+            # Evaluate clustering against ground truth
+            clustering_evaluation = self._evaluate_training_clusters(training_clusters, ground_truth_pairs)
+            
+            # Save stats
+            self.stats["classifier"] = {
+                "training": training_stats,
+                "evaluation": evaluation_stats,
+                "clustering": clustering_evaluation
+            }
+        except Exception as e:
+            logger.error(f"Error during classifier training: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
         
     def _initialize_components_for_training(self) -> None:
         """
@@ -576,12 +619,18 @@ class EntityResolutionPipeline:
         """
         logger.info("Initializing components for training data clustering")
         
-        # These are temporary instances just for training evaluation
-        self.training_imputer = NullValueImputer(self.config, self.weaviate_manager)
-        self.training_clusterer = EntityClusterer(
-            self.config, self.classifier, self.weaviate_manager, 
-            self.training_imputer, self.feature_engineer
-        )
+        try:
+            # These are temporary instances just for training evaluation
+            self.training_imputer = NullValueImputer(self.config, self.weaviate_manager)
+            self.training_clusterer = EntityClusterer(
+                self.config, self.classifier, self.weaviate_manager, 
+                self.training_imputer, self.feature_engineer
+            )
+            logger.info("Successfully initialized training components")
+        except Exception as e:
+            logger.error(f"Error initializing training components: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
         
     def _cluster_training_data(self, train_records: Dict[str, Dict]) -> List[Dict]:
         """
@@ -676,51 +725,164 @@ class EntityResolutionPipeline:
     
     def initialize_imputer_clusterer(self) -> None:
         """
-        Initialize the imputer and clusterer components.
+        Initialize the imputer and clusterer components for the full pipeline.
         """
-        logger.info("Initializing imputer and clusterer")
+        logger.info("Initializing imputer and clusterer for full dataset")
         
-        self.imputer = NullValueImputer(self.config, self.weaviate_manager)
-        self.clusterer = EntityClusterer(
-            self.config, self.classifier, self.weaviate_manager, 
-            self.imputer, self.feature_engineer
-        )
+        try:
+            # Make sure the components don't already exist
+            if hasattr(self, 'imputer') and self.imputer is not None:
+                logger.info("Imputer already initialized, skipping")
+            else:
+                self.imputer = NullValueImputer(self.config, self.weaviate_manager)
+                logger.info("Initialized imputer")
+                
+            if hasattr(self, 'clusterer') and self.clusterer is not None:
+                logger.info("Clusterer already initialized, skipping")
+            else:
+                self.clusterer = EntityClusterer(
+                    self.config, self.classifier, self.weaviate_manager, 
+                    self.imputer, self.feature_engineer
+                )
+                logger.info("Initialized clusterer")
+        except Exception as e:
+            logger.error(f"Error initializing components: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise RuntimeError(f"Failed to initialize components: {str(e)}")
     
     def run_clustering(self) -> List[Dict]:
         """
-        Run the entity clustering pipeline.
+        Run the entity clustering pipeline on the full dataset.
+        Clearly separated from the model training stage.
         
         Returns:
             List of entity clusters
         """
-        logger.info("Running entity clustering")
+        logger.info("Running entity clustering on full dataset")
+        
+        # Check if classifier is trained
+        if not hasattr(self, 'classifier') or self.classifier.weights is None:
+            logger.error("Classifier is not trained, cannot perform clustering")
+            return []
+        
+        # Check if components are initialized
+        if not hasattr(self, 'imputer') or not hasattr(self, 'clusterer'):
+            logger.error("Imputer and clusterer are not initialized, cannot perform clustering")
+            return []
+        
+        # If we don't have vectors for the full dataset yet, retrieve them
+        if not hasattr(self, 'record_embeddings') or len(self.record_embeddings) < len(self.data_processor.deduplicator.record_field_hashes):
+            self._retrieve_vectors_for_full_dataset()
+        
+        # Check if we have embeddings
+        if not self.record_embeddings:
+            logger.error("No record embeddings available, cannot perform clustering")
+            return []
         
         # Get all records
         records = []
+        total_records = len(self.record_embeddings)
+        processed_count = 0
+        error_count = 0
+        
+        logger.info(f"Reconstructing {total_records} records for clustering")
+        
         for record_id in self.record_embeddings.keys():
-            record = self.weaviate_manager.get_record_by_id(record_id)
-            if record:
-                records.append(record)
+            field_hashes = self.data_processor.deduplicator.record_field_hashes.get(record_id)
+            if field_hashes:
+                record = self._reconstruct_record_from_hashes(record_id, field_hashes)
+                if record:
+                    records.append(record)
+                    processed_count += 1
+                else:
+                    error_count += 1
+            else:
+                logger.warning(f"No field hashes found for record ID: {record_id}")
+                error_count += 1
+                
+            # Log progress for large datasets
+            if (processed_count + error_count) % 1000 == 0:
+                logger.info(f"Reconstructed {processed_count}/{total_records} records ({error_count} errors)")
         
-        # Build match graph
-        match_graph = self.clusterer.build_match_graph(records, self.record_embeddings)
+        if not records:
+            logger.error("No valid records reconstructed, cannot perform clustering")
+            return []
         
-        # Extract clusters
-        clusters = self.clusterer.extract_clusters(match_graph)
+        logger.info(f"Clustering {len(records)} records from full dataset (skipped {error_count} records with errors)")
         
-        # Save clusters
-        self.clusterer.save_clusters(clusters, os.path.join(self.output_dir, "entity_clusters.jsonl"))
-        
-        # Save stats
-        self.stats["clustering"] = {
-            "total_clusters": len(clusters),
-            "total_records_clustered": sum(cluster["size"] for cluster in clusters),
-            "average_cluster_size": sum(cluster["size"] for cluster in clusters) / len(clusters) if clusters else 0,
-            "average_confidence": sum(cluster["confidence"] for cluster in clusters) / len(clusters) if clusters else 0,
-            "llm_requests_made": self.clusterer.llm_requests_made
-        }
-        
-        return clusters
+        try:
+            # Build match graph
+            match_graph = self.clusterer.build_match_graph(records, self.record_embeddings)
+            
+            if not match_graph.nodes:
+                logger.error("Match graph has no nodes, clustering failed")
+                return []
+                
+            if not match_graph.edges:
+                logger.warning("Match graph has no edges, all records will be single-entity clusters")
+            
+            logger.info(f"Built match graph with {len(match_graph.nodes)} nodes and {len(match_graph.edges)} edges")
+            
+            # Extract clusters
+            clusters = self.clusterer.extract_clusters(match_graph)
+            
+            if not clusters:
+                logger.warning("No clusters were formed during extraction")
+            
+            logger.info(f"Extracted {len(clusters)} clusters from match graph")
+            
+            # Calculate cluster size statistics
+            if clusters:
+                sizes = [cluster["size"] for cluster in clusters]
+                avg_size = sum(sizes) / len(clusters)
+                max_size = max(sizes)
+                min_size = min(sizes)
+                
+                logger.info(f"Cluster sizes - Min: {min_size}, Avg: {avg_size:.2f}, Max: {max_size}")
+                
+                # Count clusters by size range
+                size_ranges = {"1": 0, "2-5": 0, "6-10": 0, "11-20": 0, "21-50": 0, "51+": 0}
+                for size in sizes:
+                    if size == 1:
+                        size_ranges["1"] += 1
+                    elif 2 <= size <= 5:
+                        size_ranges["2-5"] += 1
+                    elif 6 <= size <= 10:
+                        size_ranges["6-10"] += 1
+                    elif 11 <= size <= 20:
+                        size_ranges["11-20"] += 1
+                    elif 21 <= size <= 50:
+                        size_ranges["21-50"] += 1
+                    else:
+                        size_ranges["51+"] += 1
+                        
+                logger.info(f"Cluster size distribution: {size_ranges}")
+            
+            # Save clusters
+            output_file = os.path.join(self.output_dir, "entity_clusters.jsonl")
+            self.clusterer.save_clusters(clusters, output_file)
+            logger.info(f"Saved clusters to {output_file}")
+            
+            # Save stats
+            self.stats["clustering"] = {
+                "total_clusters": len(clusters),
+                "records_processed": len(records),
+                "total_records": total_records,
+                "records_with_errors": error_count,
+                "total_records_clustered": sum(cluster["size"] for cluster in clusters),
+                "average_cluster_size": sum(cluster["size"] for cluster in clusters) / len(clusters) if clusters else 0,
+                "average_confidence": sum(cluster["confidence"] for cluster in clusters) / len(clusters) if clusters else 0,
+                "cluster_size_distribution": size_ranges if clusters else {},
+                "llm_requests_made": self.clusterer.llm_requests_made
+            }
+            
+            return clusters
+        except Exception as e:
+            logger.error(f"Error during clustering: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
     
     def run_pipeline(self) -> None:
         """
@@ -731,26 +893,64 @@ class EntityResolutionPipeline:
         try:
             logger.info("Starting entity resolution pipeline")
             logger.info(f"Mode: {self.config.get('mode', 'dev')}")
+            logger.info(f"Data directory: {self.config.get('data_dir')}")
+            logger.info(f"Ground truth file: {self.config.get('ground_truth_file')}")
             logger.info(f"Checkpointing enabled: {self.config.get('enable_checkpointing', True)}")
             
+            # Validate critical directories and files
+            data_dir = self.config.get('data_dir')
+            if not os.path.exists(data_dir):
+                logger.error(f"Data directory does not exist: {data_dir}")
+                return
+                
+            ground_truth_file = self.config.get('ground_truth_file')
+            if not os.path.exists(ground_truth_file):
+                logger.error(f"Ground truth file does not exist: {ground_truth_file}")
+                return
+                
             # Phase 1: Data Processing & Indexing
             # These stages must be run before any classification/clustering
             
             # Stage 1: Preprocessing - Process all data to extract unique strings
             if not self._run_stage_with_checkpoint(self.preprocess_data, "preprocessing"):
+                logger.error("Preprocessing stage failed. Cannot continue pipeline.")
                 return
                 
+            # Validate preprocessing results
+            if not self.data_processor.deduplicator.record_field_hashes:
+                logger.error("No records were processed during preprocessing. Check your data files.")
+                return
+                
+            logger.info(f"Preprocessing completed with {len(self.data_processor.deduplicator.record_field_hashes)} records")
+                    
             # Stage 2: Embedding Generation - Create vectors for all unique strings
             if not self._run_stage_with_checkpoint(self.generate_embeddings, "embedding_generation"):
+                logger.error("Embedding generation stage failed. Cannot continue pipeline.")
                 return
                 
+            # Validate embedding results
+            if not self.embedding_generator.embeddings:
+                logger.error("No embeddings were generated. Check preprocessing outputs.")
+                return
+                
+            logger.info(f"Embedding generation completed with {len(self.embedding_generator.embeddings)} embeddings")
+                    
             # Stage 3: Weaviate Setup - Configure vector database
             if not self._run_stage_with_checkpoint(self.setup_weaviate, "weaviate_setup"):
+                logger.error("Weaviate setup stage failed. Cannot continue pipeline.")
                 return
-                
+                    
             # Stage 4: String Indexing - Index all strings and retrieve vectors
             if not self._run_stage_with_checkpoint(self.index_strings, "string_indexing"):
+                logger.error("String indexing stage failed. Cannot continue pipeline.")
                 return
+                
+            # Validate indexing results
+            if not hasattr(self, 'record_embeddings') or not self.record_embeddings:
+                logger.error("No record embeddings were created during indexing. Check Weaviate connection.")
+                return
+                
+            logger.info(f"Indexing completed with {len(self.record_embeddings)} record embeddings")
             
             # Phase 2: Model Training with Training Data Clustering
             # Train classification model and cluster training dataset for evaluation
@@ -758,26 +958,39 @@ class EntityResolutionPipeline:
             # Stage 5: Training Data Preparation
             training_data_func = lambda: self._prepare_training_data_wrapper()
             if not self._run_stage_with_checkpoint(training_data_func, "training_data_preparation"):
+                logger.error("Training data preparation stage failed. Cannot continue pipeline.")
+                return
+                    
+            train_records, test_records, ground_truth_pairs = self._prepare_training_data_wrapper()
+            
+            # Validate training data
+            if not train_records or not test_records:
+                logger.error("Training or test records are empty. Check ground truth file and preprocessing.")
                 return
                 
-            train_records, test_records, ground_truth_pairs = self._prepare_training_data_wrapper()
-                
+            logger.info(f"Training data preparation completed with {len(train_records)} train records and {len(test_records)} test records")
+                    
             # Stage 6: Classifier Training and Training Data Clustering
             classifier_func = lambda: self.train_classifier(train_records, test_records, ground_truth_pairs)
             if not self._run_stage_with_checkpoint(classifier_func, "classifier_training"):
+                logger.error("Classifier training stage failed. Cannot continue pipeline.")
                 return
-                
+                    
             # Phase 3: Full Dataset Classification & Clustering
             # Apply trained model to complete dataset
             
             # Stage 7: Component Initialization for Full Dataset
             if not self._run_stage_with_checkpoint(self.initialize_imputer_clusterer, "component_initialization"):
+                logger.error("Component initialization stage failed. Cannot continue pipeline.")
                 return
-                
+                    
             # Stage 8: Entity Clustering on Complete Dataset
             if not self._run_stage_with_checkpoint(self.run_clustering, "entity_clustering"):
+                logger.error("Entity clustering stage failed.")
                 return
                 
+            logger.info("All pipeline stages completed successfully")
+                    
         except Exception as e:
             logger.error(f"Pipeline failed: {str(e)}")
             import traceback
@@ -785,7 +998,7 @@ class EntityResolutionPipeline:
         finally:
             # Cleanup resources
             self._cleanup()
-            
+                
             # Save overall stats
             elapsed_time = time.time() - self.start_time
             self.stats["overall"] = {
@@ -793,14 +1006,14 @@ class EntityResolutionPipeline:
                 "records_processed": len(self.record_embeddings) if hasattr(self, 'record_embeddings') else 0,
                 "pipeline_run_date": datetime.now().isoformat()
             }
-            
+                
             # Update checkpoint state with final stats
             self.checkpoint_state["stats"] = self.stats
             self._save_checkpoint_state()
-            
+                
             # Log completion
             logger.info(f"Pipeline completed in {elapsed_time:.2f} seconds")
-            
+                
             # Save stats to file
             with open(os.path.join(self.output_dir, "pipeline_stats.json"), 'w') as f:
                 json.dump(self.stats, f, indent=2)
@@ -890,25 +1103,32 @@ class EntityResolutionPipeline:
         """
         logger.info("Preparing training data from ground truth")
         
+        # Parse ground truth file to get record IDs
+        ground_truth_file = self.config.get("ground_truth_file")
+        ground_truth_pairs = self.data_processor.parse_ground_truth(ground_truth_file)
+        
+        if not ground_truth_pairs:
+            logger.error("No ground truth pairs found. Check your ground truth file format.")
+            return {}, {}, []
+        
         # First, retrieve vectors for all records in ground truth
-        self._retrieve_vectors_for_training()
+        self._retrieve_vectors_for_training(ground_truth_pairs)
         
         # Then prepare the training data
         result = self.prepare_training_data()
         
         logger.info("Completed training data preparation")
         return result
-    
-    def _retrieve_vectors_for_training(self) -> None:
+
+    def _retrieve_vectors_for_training(self, ground_truth_pairs: List[Tuple[str, str, bool]]) -> None:
         """
         Retrieve vectors specifically for the training dataset.
         This is a separate step to maintain clear stage separation.
+        
+        Args:
+            ground_truth_pairs: List of ground truth pairs
         """
         logger.info("Retrieving vectors for training records")
-        
-        # Parse ground truth file to get record IDs
-        ground_truth_file = self.config.get("ground_truth_file")
-        ground_truth_pairs = self.data_processor.parse_ground_truth(ground_truth_file)
         
         # Collect all record IDs from ground truth
         record_ids = set()
@@ -925,6 +1145,10 @@ class EntityResolutionPipeline:
                 records_to_process[record_id] = self.data_processor.deduplicator.record_field_hashes[record_id]
             else:
                 logger.warning(f"Record ID {record_id} from ground truth not found in processed data")
+        
+        if not records_to_process:
+            logger.error("No matching records found between ground truth and processed data")
+            return
         
         # Batch retrieve field vectors
         self.record_embeddings = self.weaviate_manager.get_field_vectors_for_records(records_to_process)
@@ -1028,13 +1252,29 @@ class EntityResolutionPipeline:
             # Loop through each field and get its original string
             for field, hash_value in field_hashes.items():
                 if hash_value != "NULL":
-                    record[field] = unique_strings.get(hash_value, "")
+                    if hash_value in unique_strings:
+                        record[field] = unique_strings.get(hash_value, "")
+                    else:
+                        logger.warning(f"Hash value {hash_value} for field {field} in record {record_id} not found in unique strings")
+                        record[field] = ""  # Provide empty string instead of None to avoid errors
                 else:
                     record[field] = None
+            
+            # Validate that we have the minimum required fields
+            required_fields = ['person', 'roles', 'title']
+            missing_fields = [field for field in required_fields if field not in record or not record[field]]
+            
+            if missing_fields:
+                logger.warning(f"Reconstructed record {record_id} missing required fields: {missing_fields}")
+                if len(missing_fields) == len(required_fields):
+                    logger.error(f"Record {record_id} is missing all required fields, cannot use for training")
+                    return None
             
             return record
         except Exception as e:
             logger.error(f"Error reconstructing record {record_id}: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
     
     def run_clustering(self) -> List[Dict]:
@@ -1093,19 +1333,58 @@ class EntityResolutionPipeline:
         records_to_process = {}
         max_records = self.config.get("max_records")
         
+        total_records = len(self.data_processor.deduplicator.record_field_hashes)
+        logger.info(f"Total records in processed data: {total_records}")
+        
+        if max_records and max_records < total_records:
+            logger.info(f"Limiting to {max_records} records as specified in config")
+        
+        count = 0
         for record_id, field_hashes in self.data_processor.deduplicator.record_field_hashes.items():
             records_to_process[record_id] = field_hashes
-            if max_records and len(records_to_process) >= max_records:
+            count += 1
+            
+            if max_records and count >= max_records:
                 logger.info(f"Reached maximum records limit: {max_records}")
                 break
+                
+            # Log progress for large datasets
+            if count % 10000 == 0:
+                logger.info(f"Prepared {count}/{min(total_records, max_records or total_records)} records for vector retrieval")
         
-        # Batch retrieve field vectors
-        self.record_embeddings = self.weaviate_manager.get_field_vectors_for_records(records_to_process)
+        if not records_to_process:
+            logger.error("No records to process for vector retrieval")
+            return
         
-        # Save retrieved embeddings
-        self._save_record_embeddings()
+        logger.info(f"Retrieving vectors for {len(records_to_process)} records")
         
-        logger.info(f"Retrieved vectors for {len(self.record_embeddings)} records in full dataset")
+        try:
+            # Batch retrieve field vectors
+            start_time = time.time()
+            self.record_embeddings = self.weaviate_manager.get_field_vectors_for_records(records_to_process)
+            retrieval_time = time.time() - start_time
+            
+            # Save retrieved embeddings
+            self._save_record_embeddings()
+            
+            retrieved_count = len(self.record_embeddings)
+            missing_count = len(records_to_process) - retrieved_count
+            
+            logger.info(f"Retrieved vectors for {retrieved_count} records in {retrieval_time:.2f} seconds")
+            
+            if missing_count > 0:
+                logger.warning(f"Failed to retrieve vectors for {missing_count} records")
+                
+                # Check for a sample of missing records
+                missing_ids = set(records_to_process.keys()) - set(self.record_embeddings.keys())
+                if missing_ids:
+                    sample_size = min(5, len(missing_ids))
+                    sample_ids = list(missing_ids)[:sample_size]
+                    logger.warning(f"Sample of missing record IDs: {sample_ids}")
+        except Exception as e:
+            logger.error(f"Error retrieving vectors for full dataset: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def _run_stage(self, stage_func, stage_name: str) -> bool:
         """
@@ -1148,9 +1427,39 @@ class EntityResolutionPipeline:
     
     def _cleanup(self) -> None:
         """
-        Clean up resources.
+        Clean up resources and close connections.
         """
+        logger.info("Performing cleanup operations")
+        
+        # Close Weaviate connection if it exists
+        if hasattr(self, 'weaviate_manager') and self.weaviate_manager:
+            try:
+                self.weaviate_manager.close()
+                logger.info("Weaviate connection closed")
+            except Exception as e:
+                logger.warning(f"Error closing Weaviate connection: {str(e)}")
+        
+        # Close any OpenAI client connection if needed
+        if hasattr(self, 'embedding_generator') and hasattr(self.embedding_generator, 'client'):
+            try:
+                # Some API clients have close methods
+                if hasattr(self.embedding_generator.client, 'close'):
+                    self.embedding_generator.client.close()
+                    logger.info("OpenAI client connection closed")
+            except Exception as e:
+                logger.warning(f"Error closing OpenAI client: {str(e)}")
+        
         # Close any open file handles
+        try:
+            import gc
+            gc.collect()  # Force garbage collection to close any lingering file handles
+        except Exception:
+            pass
+            
+        # Check for any resources that need explicit cleanup
+        for attr_name in ['imputer', 'clusterer', 'training_imputer', 'training_clusterer']:
+            if hasattr(self, attr_name):
+                setattr(self, attr_name, None)
         
         # Remove temporary files if configured
         if self.config.get("cleanup_temp_files", True):
@@ -1158,6 +1467,11 @@ class EntityResolutionPipeline:
             for temp_dir in temp_dirs:
                 temp_path = os.path.join(self.output_dir, temp_dir)
                 if os.path.exists(temp_path):
-                    import shutil
-                    shutil.rmtree(temp_path)
-                    logger.info(f"Removed temporary directory: {temp_path}")
+                    try:
+                        import shutil
+                        shutil.rmtree(temp_path)
+                        logger.info(f"Removed temporary directory: {temp_path}")
+                    except Exception as e:
+                        logger.warning(f"Error removing temporary directory: {str(e)}")
+        
+        logger.info("Cleanup completed")

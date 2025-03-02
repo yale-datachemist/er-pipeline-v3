@@ -6,6 +6,9 @@ output_dir: "output"
 data_dir: "data"
 dev_data_dir: "dev_data"
 
+# CSV file format settings
+csv_delimiter: ","  # Set to comma for comma-delimited files
+
 # String-centric architecture settings
 clear_existing_data: false    # Whether to clear existing data before indexing
 index_entity_maps: true       # Whether to index entity-to-string maps
@@ -76,6 +79,10 @@ graph_batch_size: 1000  # Records per batch for graph building
 use_llm_fallback: true
 llm_model: "gpt-4o"
 max_llm_requests: 1000  # Limit number of LLM API calls
+
+# Debug settings
+verbose_logging: true  # Enable more detailed logging
+log_csv_parsing: true  # Log detailed CSV parsing information
 
 # Environment-specific scaling parameters
 environment:
