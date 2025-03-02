@@ -1,5 +1,4 @@
 import argparse
-import logging
 import os
 import sys
 import json
@@ -7,18 +6,10 @@ import signal
 import atexit
 from datetime import datetime
 from main_pipeline import EntityResolutionPipeline
+from logging_setup import setup_logging  # Import the new logging setup function
 
-# Configure logging
-log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-logging.basicConfig(
-    level=logging.INFO,
-    format=log_format,
-    handlers=[
-        logging.FileHandler(f"entity_resolution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+# Set up logging with proper handler management
+logger = setup_logging()
 
 # Global reference to pipeline for cleanup handlers
 pipeline_instance = None
@@ -87,6 +78,9 @@ def parse_args():
     
     parser.add_argument('--disable_cleanup', action='store_true',
                         help='Disable automatic cleanup of resources on exit')
+    
+    parser.add_argument('--log_dir', type=str, default=None,
+                        help='Directory for log files')
     
     return parser.parse_args()
 
@@ -202,6 +196,11 @@ def main():
     global pipeline_instance
     
     args = parse_args()
+    
+    # If log_dir is specified, reconfigure logging to use it
+    if args.log_dir:
+        global logger
+        logger = setup_logging(args.log_dir)
     
     # Check if config file exists
     if not os.path.exists(args.config):

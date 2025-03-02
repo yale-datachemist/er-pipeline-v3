@@ -7,6 +7,10 @@ from typing import Dict, List, Tuple, Optional, Set, Any
 import time
 from datetime import datetime
 import yaml
+from logging_setup import setup_logging  # Import the new logging setup
+
+# Set up logging with proper handler management
+logger = setup_logging()
 
 # Import modules
 from preprocessing import DataProcessor, TextDeduplicator
@@ -14,17 +18,6 @@ from embedding import EmbeddingGenerator
 from weaviate_integration import WeaviateManager
 from feature_engineering import FeatureEngineer, LogisticRegressionClassifier
 from imputation_clustering import NullValueImputer, EntityClusterer
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("entity_resolution.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
 
 class EntityResolutionPipeline:
     """
@@ -68,6 +61,10 @@ class EntityResolutionPipeline:
         # Restore state from checkpoint if needed
         self.record_embeddings = {}
         self._restore_checkpoint_data()
+        
+        logger.info(f"Pipeline initialized with config from {config_path}")
+        logger.info(f"Mode: {self.config.get('mode', 'unknown')}")
+        logger.info(f"Output directory: {self.output_dir}")
     
     def _validate_config(self) -> None:
         """Validate that the configuration contains all required parameters."""
