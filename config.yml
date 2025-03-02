@@ -6,13 +6,17 @@ output_dir: "output"
 data_dir: "data"
 dev_data_dir: "dev_data"
 
+# String-centric architecture settings
+clear_existing_data: false    # Whether to clear existing data before indexing
+index_entity_maps: true       # Whether to index entity-to-string maps
+
 # Checkpointing and caching
 checkpoint_dir: "checkpoints"
-checkpoint_frequency: 10  # Save checkpoints after processing this many files
+checkpoint_frequency: 10      # Save checkpoints after processing this many files
 use_cached_embeddings: true
 enable_checkpointing: true
 checkpoint_after_stage: true
-force_rerun: false       # Force rerun of completed stages
+force_rerun: false            # Force rerun of completed stages
 
 # Dataset limits
 max_records: 10000  # Limit for development mode, set to null for production

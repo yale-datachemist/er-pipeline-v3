@@ -2,10 +2,9 @@ import logging
 import time
 import json
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Set, Any
+from typing import Dict, List, Tuple, Optional, Set, Any, Iterable
 import weaviate
-from weaviate.client import WeaviateClient
-from weaviate.classes.config import Configure
+from weaviate.classes.config import Configure, Property, DataType, Tokenization
 from weaviate.collections import Collection
 from tqdm import tqdm
 
@@ -18,7 +17,10 @@ logger = logging.getLogger(__name__)
 
 class WeaviateManager:
     """
-    Manages interactions with Weaviate for vector storage and retrieval.
+    Manages interactions with Weaviate for string-centric vector storage and retrieval.
+    
+    This approach stores unique strings and their vectors rather than entire records,
+    drastically improving efficiency and reducing duplication.
     """
     def __init__(self, config: Dict):
         """
@@ -33,101 +35,59 @@ class WeaviateManager:
         self.retry_count = config.get("weaviate_retry_count", 3)
         
         self.client = None
-        self.collection_configs = {
-            "EntityRecord": {
-                "description": "Collection for storing entity records",
-                "vectorizer": "none",  # We provide our own vectors
-                "properties": [
-                    {
-                        "name": "record",
-                        "dataType": ["text"],
-                        "description": "Complete record text",
-                        "indexSearchable": True,
-                        "indexFilterable": True,
-                    },
-                    {
-                        "name": "person",
-                        "dataType": ["text"],
-                        "description": "Person name",
-                        "indexSearchable": True,
-                        "indexFilterable": True,
-                    },
-                    {
-                        "name": "roles",
-                        "dataType": ["text"],
-                        "description": "Person roles",
-                        "indexFilterable": True,
-                    },
-                    {
-                        "name": "title",
-                        "dataType": ["text"],
-                        "description": "Work title",
-                        "indexSearchable": True,
-                        "indexFilterable": True,
-                    },
-                    {
-                        "name": "attribution",
-                        "dataType": ["text"],
-                        "description": "Attribution statement",
-                        "indexFilterable": True,
-                    },
-                    {
-                        "name": "provision",
-                        "dataType": ["text"],
-                        "description": "Publication details",
-                        "indexFilterable": True,
-                    },
-                    {
-                        "name": "subjects",
-                        "dataType": ["text"],
-                        "description": "Subject classifications",
-                        "indexFilterable": True,
-                    },
-                    {
-                        "name": "genres",
-                        "dataType": ["text"],
-                        "description": "Genre classifications",
-                        "indexFilterable": True,
-                    },
-                    {
-                        "name": "relatedWork",
-                        "dataType": ["text"],
-                        "description": "Related work title",
-                        "indexFilterable": True,
-                    },
-                    {
-                        "name": "recordId",
-                        "dataType": ["text"],
-                        "description": "Original record ID",
-                        "indexFilterable": True,
-                        "tokenization": "field",
-                    },
-                    {
-                        "name": "id",
-                        "dataType": ["text"],
-                        "description": "Unique entity identifier",
-                        "indexFilterable": True,
-                        "tokenization": "field",
-                    },
-                    {
-                        "name": "field_vectors",
-                        "dataType": ["object"],
-                        "description": "Map of field names to vector embeddings",
-                        "indexFilterable": False,
-                    }
-                ],
-                "vectorIndexConfig": {
-                    "skip": False,
-                    "distance": "cosine",
-                },
-                "multiTenancyConfig": {
-                    "enabled": False,
-                },
-                "replicationConfig": {
-                    "factor": 1
-                }
-            }
-        }
+        
+        # List of fields that will be embedded
+        self.embedable_fields = [
+            "record", "person", "roles", "title", "attribution", 
+            "provision", "subjects", "genres", "relatedWork"
+        ]
+        
+        # Define the collection schema for unique strings
+        self.unique_strings_properties = [
+            Property(
+                name="text",
+                data_type=DataType.TEXT,
+                tokenization=Tokenization.WHITESPACE,
+                description="The unique text string"
+            ),
+            Property(
+                name="field_type",
+                data_type=DataType.TEXT,
+                tokenization=Tokenization.FIELD,
+                description="The type of field (e.g., person, title)"
+            ),
+            Property(
+                name="hash",
+                data_type=DataType.TEXT,
+                tokenization=Tokenization.FIELD,
+                description="Hash of the text string for exact lookup"
+            ),
+            Property(
+                name="frequency",
+                data_type=DataType.INT,
+                description="How many times this string appears in the dataset"
+            )
+        ]
+        
+        # Define the optional entity map schema
+        self.entity_map_properties = [
+            Property(
+                name="entity_id",
+                data_type=DataType.TEXT,
+                tokenization=Tokenization.FIELD,
+                description="Unique entity identifier"
+            ),
+            Property(
+                name="field_hashes_json",
+                data_type=DataType.TEXT,  # Store as JSON string instead of OBJECT
+                description="JSON string mapping field names to their string hashes"
+            ),
+            Property(
+                name="person_name",
+                data_type=DataType.TEXT,
+                description="Person name for this entity"
+            )
+        ]
     
     def connect(self) -> bool:
         """
@@ -138,16 +98,18 @@ class WeaviateManager:
         """
         for attempt in range(self.retry_count):
             try:
-                self.client = weaviate.Client(
-                    url=self.url,
-                    additional_headers={
-                        "X-OpenAI-Api-Key": self.config.get("openai_api_key", "")  # For potential hybrid search
-                    }
-                )
+                # Try different connection methods based on configuration
+                if self.url.startswith("http://localhost") or self.url.startswith("http://127.0.0.1"):
+                    self.client = weaviate.connect_to_local()
+                else:
+                    self.client = weaviate.connect_to_wcs(
+                        cluster_url=self.url,
+                        auth_credentials=weaviate.auth.AuthApiKey(self.config.get("weaviate_api_key", ""))
+                    )
                 
                 # Check if connection is successful
                 meta = self.client.get_meta()
-                logger.info(f"Connected to Weaviate version: {meta.version}")
+                logger.info(f"Connected to Weaviate version: {meta}")
                 return True
                 
             except weaviate.exceptions.WeaviateConnectionError as e:
@@ -179,279 +141,1084 @@ class WeaviateManager:
             existing_collections = self.client.collections.list_all()
             existing_names = [c.name for c in existing_collections]
             
-            # Create collections that don't exist or update them if needed
-            for name, config in self.collection_configs.items():
-                if name not in existing_names:
-                    logger.info(f"Creating collection: {name}")
-                    
-                    # Create collection with properties and optimized HNSW parameters
-                    collection = self.client.collections.create(
-                        name=name,
-                        description=config["description"],
-                        vectorizer_config=Configure.Vectorizer.none(),
-                        properties=config["properties"],
-                        vector_index_config=Configure.VectorIndex.hnsw(
-                            distance_metric=Configure.VectorDistance.cosine,
-                            ef=128,               # Higher values: better recall, slower queries
-                            ef_construction=128,   # Higher values: better recall, slower indexing
-                            max_connections=64     # Higher values: better recall, more memory
-                        )
-                    )
-                    
-                    logger.info(f"Created collection: {name}")
-                else:
-                    # Collection exists, should validate if schema matches expectations
-                    collection = self.client.collections.get(name)
-                    logger.info(f"Collection already exists: {name}")
-                    
-                    # Simple validation of existing properties
-                    existing_props = [prop.name for prop in collection.config.properties]
-                    expected_props = [prop["name"] for prop in config["properties"]]
-                    
-                    missing_props = set(expected_props) - set(existing_props)
-                    if missing_props:
-                        logger.warning(f"Collection {name} is missing properties: {missing_props}")
+            # Get vector index configuration based on environment
+            hnsw_config = self._get_vector_index_config()
+            
+            # Setup UniqueStrings collection
+            if "UniqueStrings" not in existing_names:
+                logger.info("Creating collection: UniqueStrings")
+                
+                self.client.collections.create(
+                    name="UniqueStrings",
+                    description="Collection for storing unique text strings and their vectors",
+                    vectorizer_config=Configure.Vectorizer.none(),
+                    properties=self.unique_strings_properties,
+                    vector_index_config=hnsw_config
+                )
+                
+                logger.info("Created collection: UniqueStrings")
+            else:
+                logger.info("Collection already exists: UniqueStrings")
+            
+            # Setup EntityMap collection (optional)
+            if "EntityMap" not in existing_names:
+                logger.info("Creating collection: EntityMap")
+                
+                self.client.collections.create(
+                    name="EntityMap",
+                    description="Collection for mapping entities to their component strings",
+                    vectorizer_config=Configure.Vectorizer.none(),  # No vectors needed
+                    properties=self.entity_map_properties
+                )
+                
+                logger.info("Created collection: EntityMap")
+            else:
+                logger.info("Collection already exists: EntityMap")
             
             return True
             
         except Exception as e:
             logger.error(f"Error setting up collections: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
     
-    def index_record(self, record: Dict, field_embeddings: Dict[str, List[float]]) -> str:
+    def _get_vector_index_config(self) -> Any:
         """
-        Index a record in Weaviate with its associated embeddings.
+        Get appropriate vector index configuration based on environment settings.
         
-        Args:
-            record: Dictionary containing record fields
-            field_embeddings: Dictionary mapping field names to embeddings
-            
         Returns:
-            UUID of the indexed object
+            Vector index configuration object
         """
-        if not self.client:
-            logger.error("Not connected to Weaviate")
-            return None
-            
-        try:
-            collection = self.client.collections.get("EntityRecord")
-            
-            # Prepare record for indexing
-            properties = {
-                "record": record.get("record", ""),
-                "person": record.get("person", ""),
-                "roles": record.get("roles", ""),
-                "title": record.get("title", ""),
-                "attribution": record.get("attribution", ""),
-                "provision": record.get("provision", ""),
-                "subjects": record.get("subjects", ""),
-                "genres": record.get("genres", ""),
-                "relatedWork": record.get("relatedWork", ""),
-                "recordId": record.get("recordId", ""),
-                "id": record.get("id", ""),
-                "field_vectors": json.dumps(field_embeddings)
-            }
-            
-            # Use person field vector as the primary vector for the record
-            vector = field_embeddings.get("person", [])
-            
-            # Add the object
-            result = collection.data.insert(
-                properties=properties,
-                vector=vector
-            )
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error indexing record: {str(e)}")
-            return None
+        # Get environment-specific parameters
+        env_settings = self.config.get("environment", {})
+        env_type = "production" if self.config.get("mode") == "production" else "development"
+        vector_params = {}
+        
+        if env_type in env_settings and "vector_index_params" in env_settings[env_type]:
+            vector_params = env_settings[env_type]["vector_index_params"]
+        
+        # Set default values if not specified
+        ef_construction = vector_params.get("ef_construction", 128)
+        ef = vector_params.get("ef", 128)
+        max_connections = vector_params.get("max_connections", 64)
+        
+        # Create HNSW configuration
+        return Configure.VectorIndex.hnsw(
+            distance_metric=weaviate.classes.config.VectorDistances.COSINE,
+            ef_construction=ef_construction,
+            max_connections=max_connections,
+            ef=ef,
+            dynamic_ef_factor=8,
+            dynamic_ef_min=100,
+            dynamic_ef_max=500,
+        )
     
-    def batch_index_records(self, records: List[Dict], embeddings_dict: Dict[str, Dict[str, List[float]]]) -> List[str]:
+    def index_unique_strings(
+        self, 
+        unique_strings: Dict[str, str], 
+        embeddings: Dict[str, List[float]], 
+        string_counts: Dict[str, int],
+        field_types: Dict[str, str]
+    ) -> bool:
         """
-        Index a batch of records in Weaviate.
+        Index unique strings and their vectors in Weaviate.
         
         Args:
-            records: List of record dictionaries
-            embeddings_dict: Dictionary mapping record IDs to field embeddings
+            unique_strings: Dictionary mapping hash -> original string
+            embeddings: Dictionary mapping hash -> vector embedding
+            string_counts: Dictionary mapping hash -> frequency count
+            field_types: Dictionary mapping hash -> field type
             
         Returns:
-            List of UUIDs for the indexed objects
+            Boolean indicating success
         """
         if not self.client:
             logger.error("Not connected to Weaviate")
-            return []
-            
+            return False
+        
         try:
-            collection = self.client.collections.get("EntityRecord")
+            collection = self.client.collections.get("UniqueStrings")
+            total_strings = len(unique_strings)
+            logger.info(f"Indexing {total_strings} unique strings")
+            
+            # Process in batches
+            batch_size = self.batch_size
+            string_hashes = list(unique_strings.keys())
             
             with collection.batch.dynamic() as batch:
-                for record in tqdm(records, desc="Indexing records"):
-                    record_id = record.get("id")
-                    if record_id not in embeddings_dict:
-                        logger.warning(f"No embeddings found for record: {record_id}")
-                        continue
+                for i in tqdm(range(0, total_strings, batch_size), desc="Indexing strings"):
+                    batch_hashes = string_hashes[i:i+batch_size]
+                    
+                    for hash_value in batch_hashes:
+                        # Skip if hash isn't in all dictionaries
+                        if (hash_value not in unique_strings or 
+                            hash_value not in embeddings or 
+                            hash_value not in field_types):
+                            continue
                         
-                    field_embeddings = embeddings_dict[record_id]
-                    
-                    # Prepare record for indexing
-                    properties = {
-                        "record": record.get("record", ""),
-                        "person": record.get("person", ""),
-                        "roles": record.get("roles", ""),
-                        "title": record.get("title", ""),
-                        "attribution": record.get("attribution", ""),
-                        "provision": record.get("provision", ""),
-                        "subjects": record.get("subjects", ""),
-                        "genres": record.get("genres", ""),
-                        "relatedWork": record.get("relatedWork", ""),
-                        "recordId": record.get("recordId", ""),
-                        "id": record_id,
-                        "field_vectors": json.dumps(field_embeddings)
-                    }
-                    
-                    # Use person field vector as the primary vector for the record
-                    vector = field_embeddings.get("person", [])
-                    
-                    # Add the object to the batch
-                    batch.add_object(
-                        properties=properties,
-                        vector=vector
-                    )
+                        # Get properties
+                        text = unique_strings[hash_value]
+                        vector = embeddings[hash_value]
+                        field_type = field_types[hash_value]
+                        frequency = string_counts.get(hash_value, 1)
+                        
+                        # Add to batch
+                        batch.add_object(
+                            properties={
+                                "text": text,
+                                "field_type": field_type,
+                                "hash": hash_value,
+                                "frequency": frequency
+                            },
+                            vector=vector
+                        )
             
+            logger.info(f"Indexed {total_strings} unique strings")
             return True
             
         except Exception as e:
-            logger.error(f"Error batch indexing records: {str(e)}")
+            logger.error(f"Error indexing unique strings: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
     
-    def search_neighbors(self, query_vector: List[float], limit: int = 10, distance_threshold: float = 0.2) -> List[Dict]:
+    def index_entity_maps(self, entity_maps: List[Dict]) -> bool:
         """
-        Search for nearest neighbors of a query vector.
+        Index entity-to-string maps in the EntityMap collection.
         
         Args:
-            query_vector: Query vector embedding
-            limit: Maximum number of results to return
-            distance_threshold: Maximum distance threshold
+            entity_maps: List of entity map dictionaries
             
         Returns:
-            List of neighbor objects
+            Boolean indicating success
         """
         if not self.client:
             logger.error("Not connected to Weaviate")
-            return []
-            
+            return False
+        
         try:
-            collection = self.client.collections.get("EntityRecord")
+            collection = self.client.collections.get("EntityMap")
+            total_entities = len(entity_maps)
+            logger.info(f"Indexing {total_entities} entity maps")
             
-            # Perform vector search
-            result = collection.query.near_vector(
-                near_vector=query_vector,
-                limit=limit,
-                return_metadata=Configure.return_metadata(distance=True),
-                return_properties=["id", "person", "title", "record"]
-            )
+            with collection.batch.dynamic() as batch:
+                for entity_map in tqdm(entity_maps, desc="Indexing entity maps"):
+                    batch.add_object(
+                        properties={
+                            "entity_id": entity_map["entity_id"],
+                            "field_hashes_json": json.dumps(entity_map["field_hashes"]),  # Serialize to JSON string
+                            "person_name": entity_map.get("person_name", "")
+                        }
+                    )
             
-            # Filter by distance threshold
-            filtered_results = []
-            for obj in result.objects:
-                distance = obj.metadata.distance
-                if distance <= distance_threshold:
-                    filtered_results.append({
-                        "id": obj.properties["id"],
-                        "person": obj.properties["person"],
-                        "title": obj.properties["title"],
-                        "record": obj.properties["record"],
-                        "distance": distance
-                    })
-            
-            return filtered_results
+            logger.info(f"Indexed {total_entities} entity maps")
+            return True
             
         except Exception as e:
-            logger.error(f"Error searching neighbors: {str(e)}")
-            return []
+            logger.error(f"Error indexing entity maps: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
     
-    def get_record_by_id(self, record_id: str) -> Optional[Dict]:
+    def get_entity_field_hashes(self, entity_id: str) -> Optional[Dict[str, str]]:
         """
-        Retrieve a record by its ID.
+        Retrieve field hashes for an entity from the EntityMap collection.
         
         Args:
-            record_id: Record ID to retrieve
+            entity_id: Entity ID to retrieve
             
         Returns:
-            Record object if found, None otherwise
+            Dictionary mapping field name -> hash, or None if not found
         """
         if not self.client:
             logger.error("Not connected to Weaviate")
             return None
-            
+        
         try:
-            collection = self.client.collections.get("EntityRecord")
+            collection = self.client.collections.get("EntityMap")
             
-            # Query by ID
+            # Query by entity_id for exact match
             result = collection.query.fetch_objects(
-                filters=collection.query.filter.by_property("id").equal(record_id),
+                filters=collection.query.filter.by_property("entity_id").equal(entity_id),
                 limit=1
             )
             
             if result.objects:
-                return result.objects[0].properties
-            else:
-                return None
-                
+                # Deserialize the JSON string back to a dictionary
+                field_hashes_json = result.objects[0].properties.get("field_hashes_json", "{}")
+                try:
+                    return json.loads(field_hashes_json)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error parsing field_hashes_json for entity {entity_id}: {e}")
+                    return {}
+            
+            return None
+            
         except Exception as e:
-            logger.error(f"Error retrieving record: {str(e)}")
+            logger.error(f"Error retrieving entity field hashes: {str(e)}")
             return None
     
-    def get_imputation_candidate_records(self, query_vector: List[float], field: str, limit: int = 10) -> List[Dict]:
+    def get_vector_by_hash(self, hash_value: str) -> Optional[List[float]]:
         """
-        Get candidate records with field vectors for imputing a missing field.
+        Retrieve a vector by its string hash.
+        
+        Args:
+            hash_value: Hash of the string
+            
+        Returns:
+            Vector embedding if found, None otherwise
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return None
+        
+        try:
+            collection = self.client.collections.get("UniqueStrings")
+            
+            # Query by hash for exact match
+            result = collection.query.fetch_objects(
+                filters=collection.query.filter.by_property("hash").equal(hash_value),
+                limit=1,
+                include_vector=True
+            )
+            
+            if result.objects:
+                return result.objects[0].vector
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error retrieving vector by hash: {str(e)}")
+            return None
+    
+    def get_vectors_by_hashes(self, hash_values: List[str]) -> Dict[str, List[float]]:
+        """
+        Retrieve multiple vectors by their string hashes in batch.
+        
+        Args:
+            hash_values: List of string hashes
+            
+        Returns:
+            Dictionary mapping hash -> vector
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return {}
+        
+        result_vectors = {}
+        unique_hashes = list(set(hash_values))  # Remove duplicates
+        
+        # Process in reasonable batch sizes
+        batch_size = 100
+        for i in range(0, len(unique_hashes), batch_size):
+            batch_hashes = unique_hashes[i:i+batch_size]
+            
+            try:
+                collection = self.client.collections.get("UniqueStrings")
+                
+                # Build filter for batch of hashes
+                hash_filter = collection.query.filter.by_property("hash").contains_any(batch_hashes)
+                
+                # Execute query
+                result = collection.query.fetch_objects(
+                    filters=hash_filter,
+                    limit=len(batch_hashes) + 10,  # Add buffer for safety
+                    include_vector=True
+                )
+                
+                # Extract vectors
+                for obj in result.objects:
+                    hash_value = obj.properties.get("hash")
+                    if hash_value and obj.vector:
+                        result_vectors[hash_value] = obj.vector
+                
+            except Exception as e:
+                logger.error(f"Error batch retrieving vectors: {str(e)}")
+        
+        # Report on missing hashes
+        missing_hashes = set(hash_values) - set(result_vectors.keys())
+        if missing_hashes:
+            logger.warning(f"Could not retrieve vectors for {len(missing_hashes)} hashes")
+        
+        return result_vectors
+    
+    def get_field_vectors_for_records(self, records_field_hashes: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, List[float]]]:
+        """
+        Retrieve vectors for multiple records in batch.
+        
+        Args:
+            records_field_hashes: Dictionary mapping record ID -> {field -> hash}
+            
+        Returns:
+            Dictionary mapping record ID -> {field -> vector}
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return {}
+        
+        # Collect all unique hashes
+        all_hashes = set()
+        for record_id, field_hashes in records_field_hashes.items():
+            for field, hash_value in field_hashes.items():
+                if hash_value != "NULL":
+                    all_hashes.add(hash_value)
+        
+        # Get all vectors in one batch request
+        hash_vectors = self.get_vectors_by_hashes(list(all_hashes))
+        
+        # Map vectors to records and fields
+        record_field_vectors = {}
+        for record_id, field_hashes in records_field_hashes.items():
+            field_vectors = {}
+            for field, hash_value in field_hashes.items():
+                if hash_value != "NULL" and hash_value in hash_vectors:
+                    field_vectors[field] = hash_vectors[hash_value]
+            
+            record_field_vectors[record_id] = field_vectors
+        
+        return record_field_vectors
+    
+    def search_similar_strings(
+        self, 
+        query_vector: List[float], 
+        field_type: Optional[str] = None, 
+        limit: int = 10
+    ) -> List[Dict]:
+        """
+        Search for strings similar to the query vector, optionally filtering by field type.
         
         Args:
             query_vector: Query vector embedding
-            field: Field to impute
+            field_type: Optional field type to filter results
             limit: Maximum number of results
             
         Returns:
-            List of candidate records with their field vectors
+            List of similar strings with their vectors and distances
         """
         if not self.client:
             logger.error("Not connected to Weaviate")
             return []
-            
+        
         try:
-            collection = self.client.collections.get("EntityRecord")
+            collection = self.client.collections.get("UniqueStrings")
             
-            # Perform vector search, only retrieving records where the field is not empty
-            result = collection.query.near_vector(
+            # Build query
+            query = collection.query.near_vector(
                 near_vector=query_vector,
-                limit=limit * 2,  # Request more to account for filtering
+                limit=limit,
                 return_metadata=Configure.return_metadata(distance=True),
-                return_properties=["id", field, "field_vectors"]
+                include_vector=True
             )
             
-            # Filter out empty values and take up to the limit
-            candidates = []
-            for obj in result.objects:
-                field_value = obj.properties.get(field)
-                if field_value and field_value.strip():
-                    # Include the field value, distance, and field_vectors
-                    candidate = {
-                        "id": obj.properties.get("id"),
-                        field: field_value,
-                        "distance": obj.metadata.distance
-                    }
-                    
-                    # Add field_vectors if available
-                    if "field_vectors" in obj.properties:
-                        candidate["field_vectors"] = obj.properties["field_vectors"]
-                    
-                    candidates.append(candidate)
-                    if len(candidates) >= limit:
-                        break
+            # Add field type filter if specified
+            if field_type:
+                query = query.with_filter(
+                    collection.query.filter.by_property("field_type").equal(field_type)
+                )
             
-            return candidates
+            # Execute query
+            result = query.fetch_objects()
+            
+            # Process results
+            similar_strings = []
+            for obj in result.objects:
+                similar_strings.append({
+                    "text": obj.properties.get("text", ""),
+                    "hash": obj.properties.get("hash", ""),
+                    "field_type": obj.properties.get("field_type", ""),
+                    "frequency": obj.properties.get("frequency", 0),
+                    "vector": obj.vector,
+                    "distance": obj.metadata.distance
+                })
+            
+            return similar_strings
             
         except Exception as e:
-            logger.error(f"Error getting imputation candidate records: {str(e)}")
+            logger.error(f"Error searching similar strings: {str(e)}")
             return []
+    
+    def get_imputation_candidates(
+        self, 
+        query_vector: List[float], 
+        field_type: str, 
+        limit: int = 10
+    ) -> List[Dict]:
+        """
+        Get candidate values for imputing a missing field using vector similarity.
+        
+        Args:
+            query_vector: Query vector embedding (typically the record vector)
+            field_type: Field type to impute
+            limit: Maximum number of candidates
+            
+        Returns:
+            List of candidate values with their vectors and distances
+        """
+        # Use search_similar_strings with field type filter
+        candidates = self.search_similar_strings(
+            query_vector=query_vector,
+            field_type=field_type,
+            limit=limit * 2  # Get more candidates to filter
+        )
+        
+        # Extract unique text values
+        unique_texts = []
+        seen_texts = set()
+        
+        for candidate in candidates:
+            text = candidate["text"]
+            if text and text.strip() and text not in seen_texts:
+                seen_texts.add(text)
+                unique_texts.append({
+                    "text": text,
+                    "vector": candidate["vector"],
+                    "distance": candidate["distance"]
+                })
+                
+                if len(unique_texts) >= limit:
+                    break
+        
+        return unique_texts
+    
+    def clear_collections(self) -> bool:
+        """
+        Clear existing collections for fresh indexing.
+        
+        Returns:
+            Boolean indicating success
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return False
+        
+        try:
+            for collection_name in ["UniqueStrings", "EntityMap"]:
+                try:
+                    collection = self.client.collections.get(collection_name)
+                    logger.info(f"Deleting all objects in collection: {collection_name}")
+                    collection.data.delete_all()
+                    logger.info(f"Successfully cleared collection: {collection_name}")
+                except:
+                    logger.info(f"Collection {collection_name} doesn't exist or is already empty")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error clearing collections: {str(e)}")
+            return False    def get_entity_field_hashes(self, entity_id: str) -> Optional[Dict[str, str]]:
+        """
+        Retrieve field hashes for an entity from the EntityMap collection.
+        
+        Args:
+            entity_id: Entity ID to retrieve
+            
+        Returns:
+            Dictionary mapping field name -> hash, or None if not found
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return None
+        
+        try:
+            collection = self.client.collections.get("EntityMap")
+            
+            # Query by entity_id for exact match
+            result = collection.query.fetch_objects(
+                filters=collection.query.filter.by_property("entity_id").equal(entity_id),
+                limit=1
+            )
+            
+            if result.objects:
+                # Deserialize the JSON string back to a dictionary
+                field_hashes_json = result.objects[0].properties.get("field_hashes_json", "{}")
+                try:
+                    return json.loads(field_hashes_json)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error parsing field_hashes_json for entity {entity_id}: {e}")
+                    return {}
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error retrieving entity field hashes: {str(e)}")
+            return Noneimport logging
+import time
+import json
+import numpy as np
+from typing import Dict, List, Tuple, Optional, Set, Any, Iterable
+import weaviate
+from weaviate.classes.config import Configure, Property, DataType, Tokenization
+from weaviate.collections import Collection
+from tqdm import tqdm
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class WeaviateManager:
+    """
+    Manages interactions with Weaviate for string-centric vector storage and retrieval.
+    
+    This approach stores unique strings and their vectors rather than entire records,
+    drastically improving efficiency and reducing duplication.
+    """
+    def __init__(self, config: Dict):
+        """
+        Initialize the Weaviate manager with configuration settings.
+        
+        Args:
+            config: Dictionary containing configuration parameters
+        """
+        self.config = config
+        self.url = config.get("weaviate_url", "http://localhost:8080")
+        self.batch_size = config.get("weaviate_batch_size", 100)
+        self.retry_count = config.get("weaviate_retry_count", 3)
+        
+        self.client = None
+        
+        # List of fields that will be embedded
+        self.embedable_fields = [
+            "record", "person", "roles", "title", "attribution", 
+            "provision", "subjects", "genres", "relatedWork"
+        ]
+        
+        # Define the collection schema for unique strings
+        self.unique_strings_properties = [
+            Property(
+                name="text",
+                data_type=DataType.TEXT,
+                tokenization=Tokenization.WHITESPACE,
+                description="The unique text string"
+            ),
+            Property(
+                name="field_type",
+                data_type=DataType.TEXT,
+                tokenization=Tokenization.FIELD,
+                description="The type of field (e.g., person, title)"
+            ),
+            Property(
+                name="hash",
+                data_type=DataType.TEXT,
+                tokenization=Tokenization.FIELD,
+                description="Hash of the text string for exact lookup"
+            ),
+            Property(
+                name="frequency",
+                data_type=DataType.INT,
+                description="How many times this string appears in the dataset"
+            )
+        ]
+        
+        # Define the optional entity map schema
+        self.entity_map_properties = [
+            Property(
+                name="entity_id",
+                data_type=DataType.TEXT,
+                tokenization=Tokenization.FIELD,
+                description="Unique entity identifier"
+            ),
+            Property(
+                name="field_hashes_json",
+                data_type=DataType.TEXT,  # Store as JSON string instead of OBJECT
+                description="JSON string mapping field names to their string hashes"
+            ),
+            Property(
+                name="person_name",
+                data_type=DataType.TEXT,
+                description="Person name for this entity"
+            )
+        ]
+
+    def connect(self) -> bool:
+        """
+        Connect to the Weaviate instance.
+        
+        Returns:
+            Boolean indicating success
+        """
+        for attempt in range(self.retry_count):
+            try:
+                # Try different connection methods based on configuration
+                if self.url.startswith("http://localhost") or self.url.startswith("http://127.0.0.1"):
+                    self.client = weaviate.connect_to_local()
+                else:
+                    self.client = weaviate.connect_to_wcs(
+                        cluster_url=self.url,
+                        auth_credentials=weaviate.auth.AuthApiKey(self.config.get("weaviate_api_key", ""))
+                    )
+                
+                # Check if connection is successful
+                meta = self.client.get_meta()
+                logger.info(f"Connected to Weaviate version: {meta}")
+                return True
+                
+            except weaviate.exceptions.WeaviateConnectionError as e:
+                logger.warning(f"Weaviate connection error (attempt {attempt+1}): {str(e)}")
+                time.sleep(2 ** attempt)  # Exponential backoff
+                
+            except Exception as e:
+                logger.warning(f"Connection attempt {attempt+1} failed: {str(e)}")
+                import traceback
+                logger.warning(traceback.format_exc())
+                time.sleep(2 ** attempt)  # Exponential backoff
+        
+        logger.error(f"Failed to connect to Weaviate after {self.retry_count} attempts")
+        return False
+    
+    def setup_collections(self) -> bool:
+        """
+        Set up the required collections in Weaviate.
+        
+        Returns:
+            Boolean indicating success
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return False
+            
+        try:
+            # Check if collections already exist
+            existing_collections = self.client.collections.list_all()
+            existing_names = [c.name for c in existing_collections]
+            
+            # Get vector index configuration based on environment
+            hnsw_config = self._get_vector_index_config()
+            
+            # Setup UniqueStrings collection
+            if "UniqueStrings" not in existing_names:
+                logger.info("Creating collection: UniqueStrings")
+                
+                self.client.collections.create(
+                    name="UniqueStrings",
+                    description="Collection for storing unique text strings and their vectors",
+                    vectorizer_config=Configure.Vectorizer.none(),
+                    properties=self.unique_strings_properties,
+                    vector_index_config=hnsw_config
+                )
+                
+                logger.info("Created collection: UniqueStrings")
+            else:
+                logger.info("Collection already exists: UniqueStrings")
+            
+            # Setup EntityMap collection (optional)
+            if "EntityMap" not in existing_names:
+                logger.info("Creating collection: EntityMap")
+                
+                self.client.collections.create(
+                    name="EntityMap",
+                    description="Collection for mapping entities to their component strings",
+                    vectorizer_config=Configure.Vectorizer.none(),  # No vectors needed
+                    properties=self.entity_map_properties
+                )
+                
+                logger.info("Created collection: EntityMap")
+            else:
+                logger.info("Collection already exists: EntityMap")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error setting up collections: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+    
+    def _get_vector_index_config(self) -> Any:
+        """
+        Get appropriate vector index configuration based on environment settings.
+        
+        Returns:
+            Vector index configuration object
+        """
+        # Get environment-specific parameters
+        env_settings = self.config.get("environment", {})
+        env_type = "production" if self.config.get("mode") == "production" else "development"
+        vector_params = {}
+        
+        if env_type in env_settings and "vector_index_params" in env_settings[env_type]:
+            vector_params = env_settings[env_type]["vector_index_params"]
+        
+        # Set default values if not specified
+        ef_construction = vector_params.get("ef_construction", 128)
+        ef = vector_params.get("ef", 128)
+        max_connections = vector_params.get("max_connections", 64)
+        
+        # Create HNSW configuration
+        return Configure.VectorIndex.hnsw(
+            distance_metric=weaviate.classes.config.VectorDistances.COSINE,
+            ef_construction=ef_construction,
+            max_connections=max_connections,
+            ef=ef,
+            dynamic_ef_factor=8,
+            dynamic_ef_min=100,
+            dynamic_ef_max=500,
+        )
+    
+    def index_unique_strings(self, unique_strings: Dict[str, str], 
+                            embeddings: Dict[str, List[float]], 
+                            string_counts: Dict[str, int],
+                            field_types: Dict[str, str]) -> bool:
+        """
+        Index unique strings and their vectors in Weaviate.
+        
+        Args:
+            unique_strings: Dictionary mapping hash -> original string
+            embeddings: Dictionary mapping hash -> vector embedding
+            string_counts: Dictionary mapping hash -> frequency count
+            field_types: Dictionary mapping hash -> field type
+            
+        Returns:
+            Boolean indicating success
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return False
+        
+        try:
+            collection = self.client.collections.get("UniqueStrings")
+            total_strings = len(unique_strings)
+            logger.info(f"Indexing {total_strings} unique strings")
+            
+            # Process in batches
+            batch_size = self.batch_size
+            string_hashes = list(unique_strings.keys())
+            
+            with collection.batch.dynamic() as batch:
+                for i in tqdm(range(0, total_strings, batch_size), desc="Indexing strings"):
+                    batch_hashes = string_hashes[i:i+batch_size]
+                    
+                    for hash_value in batch_hashes:
+                        # Skip if hash isn't in all dictionaries
+                        if (hash_value not in unique_strings or 
+                            hash_value not in embeddings or 
+                            hash_value not in field_types):
+                            continue
+                        
+                        # Get properties
+                        text = unique_strings[hash_value]
+                        vector = embeddings[hash_value]
+                        field_type = field_types[hash_value]
+                        frequency = string_counts.get(hash_value, 1)
+                        
+                        # Add to batch
+                        batch.add_object(
+                            properties={
+                                "text": text,
+                                "field_type": field_type,
+                                "hash": hash_value,
+                                "frequency": frequency
+                            },
+                            vector=vector
+                        )
+            
+            logger.info(f"Indexed {total_strings} unique strings")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error indexing unique strings: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+    
+    def index_entity_maps(self, entity_maps: List[Dict]) -> bool:
+        """
+        Index entity-to-string maps in the EntityMap collection.
+        
+        Args:
+            entity_maps: List of entity map dictionaries
+            
+        Returns:
+            Boolean indicating success
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return False
+        
+        try:
+            collection = self.client.collections.get("EntityMap")
+            total_entities = len(entity_maps)
+            logger.info(f"Indexing {total_entities} entity maps")
+            
+            with collection.batch.dynamic() as batch:
+                for entity_map in tqdm(entity_maps, desc="Indexing entity maps"):
+                    batch.add_object(
+                        properties={
+                            "entity_id": entity_map["entity_id"],
+                            "field_hashes_json": json.dumps(entity_map["field_hashes"]),  # Serialize to JSON string
+                            "person_name": entity_map.get("person_name", "")
+                        }
+                    )
+            
+            logger.info(f"Indexed {total_entities} entity maps")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error indexing entity maps: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+    
+    def get_vector_by_hash(self, hash_value: str) -> Optional[List[float]]:
+        """
+        Retrieve a vector by its string hash.
+        
+        Args:
+            hash_value: Hash of the string
+            
+        Returns:
+            Vector embedding if found, None otherwise
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return None
+        
+        try:
+            collection = self.client.collections.get("UniqueStrings")
+            
+            # Query by hash for exact match
+            result = collection.query.fetch_objects(
+                filters=collection.query.filter.by_property("hash").equal(hash_value),
+                limit=1,
+                include_vector=True
+            )
+            
+            if result.objects:
+                return result.objects[0].vector
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error retrieving vector by hash: {str(e)}")
+            return None
+    
+    def get_vectors_by_hashes(self, hash_values: List[str]) -> Dict[str, List[float]]:
+        """
+        Retrieve multiple vectors by their string hashes in batch.
+        
+        Args:
+            hash_values: List of string hashes
+            
+        Returns:
+            Dictionary mapping hash -> vector
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return {}
+        
+        result_vectors = {}
+        unique_hashes = list(set(hash_values))  # Remove duplicates
+        
+        # Process in reasonable batch sizes
+        batch_size = 100
+        for i in range(0, len(unique_hashes), batch_size):
+            batch_hashes = unique_hashes[i:i+batch_size]
+            
+            try:
+                collection = self.client.collections.get("UniqueStrings")
+                
+                # Build filter for batch of hashes
+                hash_filter = collection.query.filter.by_property("hash").contains_any(batch_hashes)
+                
+                # Execute query
+                result = collection.query.fetch_objects(
+                    filters=hash_filter,
+                    limit=len(batch_hashes) + 10,  # Add buffer for safety
+                    include_vector=True
+                )
+                
+                # Extract vectors
+                for obj in result.objects:
+                    hash_value = obj.properties.get("hash")
+                    if hash_value and obj.vector:
+                        result_vectors[hash_value] = obj.vector
+                
+            except Exception as e:
+                logger.error(f"Error batch retrieving vectors: {str(e)}")
+        
+        # Report on missing hashes
+        missing_hashes = set(hash_values) - set(result_vectors.keys())
+        if missing_hashes:
+            logger.warning(f"Could not retrieve vectors for {len(missing_hashes)} hashes")
+        
+        return result_vectors
+    
+    def search_similar_strings(self, query_vector: List[float], 
+                              field_type: Optional[str] = None, 
+                              limit: int = 10) -> List[Dict]:
+        """
+        Search for strings similar to the query vector, optionally filtering by field type.
+        
+        Args:
+            query_vector: Query vector embedding
+            field_type: Optional field type to filter results
+            limit: Maximum number of results
+            
+        Returns:
+            List of similar strings with their vectors and distances
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return []
+        
+        try:
+            collection = self.client.collections.get("UniqueStrings")
+            
+            # Build query
+            query = collection.query.near_vector(
+                near_vector=query_vector,
+                limit=limit,
+                return_metadata=Configure.return_metadata(distance=True),
+                include_vector=True
+            )
+            
+            # Add field type filter if specified
+            if field_type:
+                query = query.with_filter(
+                    collection.query.filter.by_property("field_type").equal(field_type)
+                )
+            
+            # Execute query
+            result = query.fetch_objects()
+            
+            # Process results
+            similar_strings = []
+            for obj in result.objects:
+                similar_strings.append({
+                    "text": obj.properties.get("text", ""),
+                    "hash": obj.properties.get("hash", ""),
+                    "field_type": obj.properties.get("field_type", ""),
+                    "frequency": obj.properties.get("frequency", 0),
+                    "vector": obj.vector,
+                    "distance": obj.metadata.distance
+                })
+            
+            return similar_strings
+            
+        except Exception as e:
+            logger.error(f"Error searching similar strings: {str(e)}")
+            return []
+    
+    def get_imputation_candidates(self, query_vector: List[float], field_type: str, limit: int = 10) -> List[Dict]:
+        """
+        Get candidate values for imputing a missing field using vector similarity.
+        
+        Args:
+            query_vector: Query vector embedding (typically the record vector)
+            field_type: Field type to impute
+            limit: Maximum number of candidates
+            
+        Returns:
+            List of candidate values with their vectors and distances
+        """
+        # Use search_similar_strings with field type filter
+        candidates = self.search_similar_strings(
+            query_vector=query_vector,
+            field_type=field_type,
+            limit=limit * 2  # Get more candidates to filter
+        )
+        
+        # Extract unique text values
+        unique_texts = []
+        seen_texts = set()
+        
+        for candidate in candidates:
+            text = candidate["text"]
+            if text and text.strip() and text not in seen_texts:
+                seen_texts.add(text)
+                unique_texts.append({
+                    "text": text,
+                    "vector": candidate["vector"],
+                    "distance": candidate["distance"]
+                })
+                
+                if len(unique_texts) >= limit:
+                    break
+        
+        return unique_texts
+    
+    def get_field_vectors_for_record(self, field_hashes: Dict[str, str]) -> Dict[str, List[float]]:
+        """
+        Retrieve vectors for all fields in a record by their hashes.
+        
+        Args:
+            field_hashes: Dictionary mapping field name -> string hash
+            
+        Returns:
+            Dictionary mapping field name -> vector
+        """
+        # Collect all hashes that need vectors
+        hash_list = [h for f, h in field_hashes.items() if h != "NULL"]
+        
+        # Get vectors in batch
+        hash_vectors = self.get_vectors_by_hashes(hash_list)
+        
+        # Map vectors back to fields
+        field_vectors = {}
+        for field, hash_value in field_hashes.items():
+            if hash_value != "NULL" and hash_value in hash_vectors:
+                field_vectors[field] = hash_vectors[hash_value]
+        
+        return field_vectors
+    
+    def get_field_vectors_for_records(self, records_field_hashes: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, List[float]]]:
+        """
+        Retrieve vectors for multiple records in batch.
+        
+        Args:
+            records_field_hashes: Dictionary mapping record ID -> {field -> hash}
+            
+        Returns:
+            Dictionary mapping record ID -> {field -> vector}
+        """
+        # Collect all unique hashes
+        all_hashes = set()
+        for record_id, field_hashes in records_field_hashes.items():
+            for field, hash_value in field_hashes.items():
+                if hash_value != "NULL":
+                    all_hashes.add(hash_value)
+        
+        # Get all vectors in one batch request
+        hash_vectors = self.get_vectors_by_hashes(list(all_hashes))
+        
+        # Map vectors to records and fields
+        record_field_vectors = {}
+        for record_id, field_hashes in records_field_hashes.items():
+            field_vectors = {}
+            for field, hash_value in field_hashes.items():
+                if hash_value != "NULL" and hash_value in hash_vectors:
+                    field_vectors[field] = hash_vectors[hash_value]
+            
+            record_field_vectors[record_id] = field_vectors
+        
+        return record_field_vectors
+    
+    def clear_collections(self) -> bool:
+        """
+        Clear existing collections for fresh indexing.
+        
+        Returns:
+            Boolean indicating success
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return False
+        
+        try:
+            for collection_name in ["UniqueStrings", "EntityMap"]:
+                try:
+                    collection = self.client.collections.get(collection_name)
+                    logger.info(f"Deleting all objects in collection: {collection_name}")
+                    collection.data.delete_all()
+                    logger.info(f"Successfully cleared collection: {collection_name}")
+                except:
+                    logger.info(f"Collection {collection_name} doesn't exist or is already empty")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error clearing collections: {str(e)}")
+            return False

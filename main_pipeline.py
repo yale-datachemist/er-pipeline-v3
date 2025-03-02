@@ -1,4 +1,68 @@
-import os
+    def _load_config(self, config_path: str) -> Dict:
+        """
+        Load configuration from a YAML file with environment-specific scaling parameters.
+        
+        Args:
+            config_path: Path to the configuration file
+            
+        Returns:
+            Configuration dictionary
+        """
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        # Set environment-specific defaults
+        mode = config.get("mode", "dev")
+        
+        # Apply environment-specific settings based on mode
+        env_settings = None
+        if mode == "dev":
+            env_type = "development"
+            config.setdefault("max_records", 10000)
+            config.setdefault("checkpoint_frequency", 10)
+        else:  # production mode
+            env_type = "production"
+            config.setdefault("max_records", None)  # Process all records
+            config.setdefault("checkpoint_frequency", 50)
+        
+        # Apply environment scaling parameters if available
+        if "environment" in config and env_type in config["environment"]:
+            env_settings = config["environment"][env_type]
+            
+            # Update batch sizes
+            if "batch_sizes" in env_settings:
+                batch_sizes = env_settings["batch_sizes"]
+                if "embedding" in batch_sizes:
+                    config["embedding_batch_size"] = batch_sizes["embedding"]
+                if "weaviate" in batch_sizes:
+                    config["weaviate_batch_size"] = batch_sizes["weaviate"]
+                if "graph" in batch_sizes:
+                    config["graph_batch_size"] = batch_sizes["graph"]
+            
+            # Update parallelism
+            if "parallelism" in env_settings:
+                config["embedding_workers"] = env_settings["parallelism"]
+            
+            # Update memory limits
+            if "memory_limits" in env_settings:
+                for key, value in env_settings["memory_limits"].items():
+                    config[key] = value
+            
+            # Update vector index parameters for Weaviate
+            if "vector_index_params" in env_settings:
+                config["vector_index_params"] = env_settings["vector_index_params"]
+            
+            # Update Weaviate resource limits (for Docker Compose)
+            if "weaviate_resources" in env_settings:
+                config["weaviate_resources"] = env_settings["weaviate_resources"]
+            
+            logger.info(f"Applied {env_type} environment scaling parameters")
+        
+        # Add checkpointing settings
+        config.setdefault("enable_checkpointing", True)
+        config.setdefault("checkpoint_after_stage", True)
+        
+        return configimport os
 import json
 import logging
 import argparse
@@ -331,71 +395,92 @@ class EntityResolutionPipeline:
     
     def index_records(self) -> None:
         """
-        Index records in Weaviate with improved efficiency.
+        Index string data in Weaviate with the string-centric approach.
         """
-        logger.info("Indexing records in Weaviate")
+        logger.info("Indexing string data in Weaviate")
         
-        # Create an index of record_id to file_path first for efficient lookup
-        record_file_map = {}
-        logger.info("Building record ID to file mapping...")
-        for file_name in os.listdir(self.config.get("data_dir")):
-            if file_name.endswith('.csv'):
-                file_path = os.path.join(self.config.get("data_dir"), file_name)
-                try:
-                    # Only read the ID column for mapping
-                    df_ids = pd.read_csv(file_path, sep='\t', usecols=['id'], dtype=str, on_bad_lines='warn')
-                    for record_id in df_ids['id']:
-                        record_file_map[record_id] = file_path
-                except Exception as e:
-                    logger.warning(f"Error reading IDs from {file_path}: {str(e)}")
+        # If required, clear existing data
+        if self.config.get("clear_existing_data", False):
+            self.weaviate_manager.clear_collections()
         
-        logger.info(f"Built mapping for {len(record_file_map)} record IDs")
+        # Prepare string data for indexing
+        unique_strings = self.data_processor.deduplicator.unique_strings
+        string_counts = self.data_processor.deduplicator.string_counts
         
-        # Prepare records and their embeddings
-        records = []
-        record_embeddings = {}
+        logger.info(f"Prepared {len(unique_strings)} unique strings for indexing")
         
-        # Process each record with efficient lookup
-        for record_id, field_hashes in tqdm(self.data_processor.deduplicator.record_field_hashes.items(), 
-                                           desc="Preparing records"):
-            if record_id in record_file_map:
-                file_path = record_file_map[record_id]
-                try:
-                    df = pd.read_csv(file_path, sep='\t', dtype=str, on_bad_lines='warn')
-                    record_rows = df[df['id'] == record_id]
-                    if not record_rows.empty:
-                        original_record = record_rows.iloc[0].to_dict()
-                        
-                        # Get embeddings for each field
-                        field_embeddings = {}
-                        for field, hash_value in field_hashes.items():
-                            if hash_value != "NULL" and hash_value in self.embedding_generator.embeddings:
-                                field_embeddings[field] = self.embedding_generator.embeddings[hash_value]
-                        
-                        # Store record and embeddings
-                        records.append(original_record)
-                        record_embeddings[record_id] = field_embeddings
-                except Exception as e:
-                    logger.warning(f"Error retrieving record {record_id}: {str(e)}")
+        # Get field type mapping (hash -> field type)
+        field_types = self.data_processor.deduplicator.field_types
+        
+        # Ensure all strings have field types (fallback to field mappings if needed)
+        if len(field_types) < len(unique_strings):
+            logger.warning(f"Field types incomplete ({len(field_types)} vs {len(unique_strings)} strings), generating missing mappings")
+            for record_id, field_hash_map in self.data_processor.deduplicator.record_field_hashes.items():
+                for field, hash_value in field_hash_map.items():
+                    if hash_value != "NULL" and hash_value not in field_types:
+                        field_types[hash_value] = field
+        
+        logger.info(f"Using {len(field_types)} field type mappings")
+        
+        # Index unique strings with their vectors
+        success = self.weaviate_manager.index_unique_strings(
+            unique_strings=unique_strings,
+            embeddings=self.embedding_generator.embeddings,
+            string_counts=string_counts,
+            field_types=field_types
+        )
+        
+        if not success:
+            logger.error("Failed to index unique strings in Weaviate")
+            raise RuntimeError("String indexing failed")
+        
+        # Prepare entity maps
+        entity_maps = []
+        for record_id, field_hashes in self.data_processor.deduplicator.record_field_hashes.items():
+            person_name = ""
+            person_hash = field_hashes.get("person")
+            if person_hash != "NULL":
+                person_name = unique_strings.get(person_hash, "")
+                
+            entity_maps.append({
+                "entity_id": record_id,
+                "field_hashes": field_hashes,
+                "person_name": person_name
+            })
             
-            # Check if we've reached the record limit (for dev mode)
+            # Limit number of entities in development mode
             max_records = self.config.get("max_records")
-            if max_records and len(records) >= max_records:
+            if max_records and len(entity_maps) >= max_records:
                 logger.info(f"Reached maximum records limit: {max_records}")
                 break
         
-        # Index records in batches
-        success = self.weaviate_manager.batch_index_records(records, record_embeddings)
-        if not success:
-            logger.error("Failed to index records in Weaviate")
-            raise RuntimeError("Record indexing failed")
+        # Index entity maps (optional)
+        if self.config.get("index_entity_maps", True):
+            success = self.weaviate_manager.index_entity_maps(entity_maps)
+            if not success:
+                logger.warning("Failed to index entity maps (non-critical)")
         
-        # Store record embeddings for later use
-        self.record_embeddings = record_embeddings
+        # Retrieve field vectors for all records
+        logger.info("Retrieving field vectors for records")
+        records_to_process = {}
+        for record_id, field_hashes in self.data_processor.deduplicator.record_field_hashes.items():
+            # Apply record limit
+            if max_records and len(records_to_process) >= max_records:
+                break
+                
+            records_to_process[record_id] = field_hashes
+        
+        # Batch retrieve field vectors
+        self.record_embeddings = self.weaviate_manager.get_field_vectors_for_records(records_to_process)
+        
+        # Save retrieved embeddings for later use
+        self._save_record_embeddings()
         
         # Save stats
         self.stats["indexing"] = {
-            "records_indexed": len(records)
+            "unique_strings_indexed": len(unique_strings),
+            "entity_maps_indexed": len(entity_maps),
+            "records_processed": len(self.record_embeddings)
         }
     
     def prepare_training_data(self) -> Tuple[List[Dict], List[Dict], List[Tuple]]:
@@ -462,7 +547,7 @@ class EntityResolutionPipeline:
     def train_classifier(self, train_records: Dict[str, Dict], test_records: Dict[str, Dict], 
                         ground_truth_pairs: List[Tuple]) -> None:
         """
-        Train and evaluate the classifier.
+        Train and evaluate the classifier, and perform clustering on the training data.
         
         Args:
             train_records: Dictionary of training records
@@ -505,11 +590,126 @@ class EntityResolutionPipeline:
         
         logger.info(f"Classifier training complete. Test accuracy: {evaluation_stats['accuracy']:.4f}")
         
+        # Initialize components needed for clustering (temporary for training data only)
+        self._initialize_components_for_training()
+        
+        # Perform clustering on training data
+        training_clusters = self._cluster_training_data(train_records)
+        
+        # Evaluate clustering against ground truth
+        clustering_evaluation = self._evaluate_training_clusters(training_clusters, ground_truth_pairs)
+        
         # Save stats
         self.stats["classifier"] = {
             "training": training_stats,
-            "evaluation": evaluation_stats
+            "evaluation": evaluation_stats,
+            "clustering": clustering_evaluation
         }
+        
+    def _initialize_components_for_training(self) -> None:
+        """
+        Initialize imputer and clusterer components for training data clustering.
+        This is separate from the component initialization for the full dataset.
+        """
+        logger.info("Initializing components for training data clustering")
+        
+        # These are temporary instances just for training evaluation
+        self.training_imputer = NullValueImputer(self.config, self.weaviate_manager)
+        self.training_clusterer = EntityClusterer(
+            self.config, self.classifier, self.weaviate_manager, 
+            self.training_imputer, self.feature_engineer
+        )
+        
+    def _cluster_training_data(self, train_records: Dict[str, Dict]) -> List[Dict]:
+        """
+        Apply the clustering process to the training data.
+        
+        Args:
+            train_records: Dictionary of training records
+            
+        Returns:
+            List of clusters from training data
+        """
+        logger.info("Clustering training data")
+        
+        # Convert dictionary to list
+        records_list = list(train_records.values())
+        
+        # Build match graph for training data
+        train_graph = self.training_clusterer.build_match_graph(records_list, self.record_embeddings)
+        
+        # Extract clusters
+        train_clusters = self.training_clusterer.extract_clusters(train_graph)
+        
+        # Save training clusters for analysis
+        self.training_clusterer.save_clusters(
+            train_clusters, 
+            os.path.join(self.output_dir, "training_clusters.jsonl")
+        )
+        
+        logger.info(f"Created {len(train_clusters)} clusters from training data")
+        return train_clusters
+    
+    def _evaluate_training_clusters(self, clusters: List[Dict], ground_truth_pairs: List[Tuple]) -> Dict:
+        """
+        Evaluate training data clustering against ground truth.
+        
+        Args:
+            clusters: List of clusters from training data
+            ground_truth_pairs: List of ground truth pairs (left_id, right_id, is_match)
+            
+        Returns:
+            Dictionary of evaluation metrics
+        """
+        logger.info("Evaluating training clusters against ground truth")
+        
+        # Build a mapping of record_id to cluster_id
+        record_to_cluster = {}
+        for cluster in clusters:
+            cluster_id = cluster["cluster_id"]
+            for record_id in cluster["records"]:
+                record_to_cluster[record_id] = cluster_id
+        
+        # Count metrics
+        true_positives = 0
+        false_positives = 0
+        true_negatives = 0
+        false_negatives = 0
+        
+        # Compare clustering results with ground truth
+        for left_id, right_id, is_match in ground_truth_pairs:
+            # Skip if either record is not in clustering results
+            if left_id not in record_to_cluster or right_id not in record_to_cluster:
+                continue
+                
+            same_cluster = record_to_cluster[left_id] == record_to_cluster[right_id]
+            
+            if is_match and same_cluster:
+                true_positives += 1
+            elif is_match and not same_cluster:
+                false_negatives += 1
+            elif not is_match and same_cluster:
+                false_positives += 1
+            elif not is_match and not same_cluster:
+                true_negatives += 1
+        
+        # Calculate metrics
+        precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+        recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        
+        evaluation = {
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1,
+            "true_positives": true_positives,
+            "false_positives": false_positives,
+            "true_negatives": true_negatives,
+            "false_negatives": false_negatives
+        }
+        
+        logger.info(f"Training clusters evaluation: Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}")
+        return evaluation
     
     def initialize_imputer_clusterer(self) -> None:
         """
@@ -561,7 +761,7 @@ class EntityResolutionPipeline:
     
     def run_pipeline(self) -> None:
         """
-        Run the complete entity resolution pipeline with improved error handling and checkpointing.
+        Run the complete entity resolution pipeline with improved separation of stages.
         """
         self.start_time = time.time()
         
@@ -570,39 +770,48 @@ class EntityResolutionPipeline:
             logger.info(f"Mode: {self.config.get('mode', 'dev')}")
             logger.info(f"Checkpointing enabled: {self.config.get('enable_checkpointing', True)}")
             
-            # Run stages with checkpointing
+            # Phase 1: Data Processing & Indexing
+            # These stages must be run before any classification/clustering
+            
+            # Stage 1: Preprocessing - Process all data to extract unique strings
             if not self._run_stage_with_checkpoint(self.preprocess_data, "preprocessing"):
                 return
                 
+            # Stage 2: Embedding Generation - Create vectors for all unique strings
             if not self._run_stage_with_checkpoint(self.generate_embeddings, "embedding_generation"):
                 return
                 
+            # Stage 3: Weaviate Setup - Configure vector database
             if not self._run_stage_with_checkpoint(self.setup_weaviate, "weaviate_setup"):
                 return
                 
-            if not self._run_stage_with_checkpoint(self.index_records, "record_indexing"):
+            # Stage 4: String Indexing - Index all strings and retrieve vectors
+            if not self._run_stage_with_checkpoint(self.index_strings, "string_indexing"):
                 return
-                
-            # Save record embeddings for checkpointing
-            self._save_record_embeddings()
             
-            train_records, test_records, ground_truth_pairs = None, None, None
+            # Phase 2: Model Training with Training Data Clustering
+            # Train classification model and cluster training dataset for evaluation
             
-            # Use a lambda to capture the return values
+            # Stage 5: Training Data Preparation
             training_data_func = lambda: self._prepare_training_data_wrapper()
             if not self._run_stage_with_checkpoint(training_data_func, "training_data_preparation"):
                 return
                 
             train_records, test_records, ground_truth_pairs = self._prepare_training_data_wrapper()
                 
-            # Use another lambda to pass the arguments
+            # Stage 6: Classifier Training and Training Data Clustering
             classifier_func = lambda: self.train_classifier(train_records, test_records, ground_truth_pairs)
             if not self._run_stage_with_checkpoint(classifier_func, "classifier_training"):
                 return
                 
+            # Phase 3: Full Dataset Classification & Clustering
+            # Apply trained model to complete dataset
+            
+            # Stage 7: Component Initialization for Full Dataset
             if not self._run_stage_with_checkpoint(self.initialize_imputer_clusterer, "component_initialization"):
                 return
                 
+            # Stage 8: Entity Clustering on Complete Dataset
             if not self._run_stage_with_checkpoint(self.run_clustering, "entity_clustering"):
                 return
                 
@@ -632,16 +841,308 @@ class EntityResolutionPipeline:
             # Save stats to file
             with open(os.path.join(self.output_dir, "pipeline_stats.json"), 'w') as f:
                 json.dump(self.stats, f, indent=2)
+                
+    def index_strings(self) -> None:
+        """
+        Index string data in Weaviate with the string-centric approach.
+        This is now a separate stage from the record indexing.
+        """
+        logger.info("Indexing string data in Weaviate")
+        
+        # If required, clear existing data
+        if self.config.get("clear_existing_data", False):
+            self.weaviate_manager.clear_collections()
+        
+        # Prepare string data for indexing
+        unique_strings = self.data_processor.deduplicator.unique_strings
+        string_counts = self.data_processor.deduplicator.string_counts
+        
+        logger.info(f"Prepared {len(unique_strings)} unique strings for indexing")
+        
+        # Get field type mapping (hash -> field type)
+        field_types = self.data_processor.deduplicator.field_types
+        
+        # Ensure all strings have field types (fallback to field mappings if needed)
+        if len(field_types) < len(unique_strings):
+            logger.warning(f"Field types incomplete ({len(field_types)} vs {len(unique_strings)} strings), generating missing mappings")
+            for record_id, field_hash_map in self.data_processor.deduplicator.record_field_hashes.items():
+                for field, hash_value in field_hash_map.items():
+                    if hash_value != "NULL" and hash_value not in field_types:
+                        field_types[hash_value] = field
+        
+        logger.info(f"Using {len(field_types)} field type mappings")
+        
+        # Index unique strings with their vectors
+        success = self.weaviate_manager.index_unique_strings(
+            unique_strings=unique_strings,
+            embeddings=self.embedding_generator.embeddings,
+            string_counts=string_counts,
+            field_types=field_types
+        )
+        
+        if not success:
+            logger.error("Failed to index unique strings in Weaviate")
+            raise RuntimeError("String indexing failed")
+        
+        # Prepare entity maps
+        entity_maps = []
+        for record_id, field_hashes in self.data_processor.deduplicator.record_field_hashes.items():
+            person_name = ""
+            person_hash = field_hashes.get("person")
+            if person_hash != "NULL":
+                person_name = unique_strings.get(person_hash, "")
+                
+            entity_maps.append({
+                "entity_id": record_id,
+                "field_hashes": field_hashes,
+                "person_name": person_name
+            })
+            
+            # Limit number of entities in development mode
+            max_records = self.config.get("max_records")
+            if max_records and len(entity_maps) >= max_records:
+                logger.info(f"Reached maximum records limit: {max_records}")
+                break
+        
+        # Index entity maps (optional)
+        if self.config.get("index_entity_maps", True):
+            success = self.weaviate_manager.index_entity_maps(entity_maps)
+            if not success:
+                logger.warning("Failed to index entity maps (non-critical)")
+        
+        # Save stats
+        self.stats["string_indexing"] = {
+            "unique_strings_indexed": len(unique_strings),
+            "entity_maps_indexed": len(entity_maps),
+            "field_types_mapped": len(field_types)
+        }
     
     def _prepare_training_data_wrapper(self) -> Tuple[Dict, Dict, List]:
         """
         Wrapper for prepare_training_data that returns the results.
+        Clearly separates training data preparation from model training.
         
         Returns:
             Tuple of (train_records, test_records, ground_truth_pairs)
         """
+        logger.info("Preparing training data from ground truth")
+        
+        # First, retrieve vectors for all records in ground truth
+        self._retrieve_vectors_for_training()
+        
+        # Then prepare the training data
         result = self.prepare_training_data()
+        
+        logger.info("Completed training data preparation")
         return result
+    
+    def _retrieve_vectors_for_training(self) -> None:
+        """
+        Retrieve vectors specifically for the training dataset.
+        This is a separate step to maintain clear stage separation.
+        """
+        logger.info("Retrieving vectors for training records")
+        
+        # Parse ground truth file to get record IDs
+        ground_truth_file = self.config.get("ground_truth_file")
+        ground_truth_pairs = self.data_processor.parse_ground_truth(ground_truth_file)
+        
+        # Collect all record IDs from ground truth
+        record_ids = set()
+        for left_id, right_id, _ in ground_truth_pairs:
+            record_ids.add(left_id)
+            record_ids.add(right_id)
+        
+        logger.info(f"Found {len(record_ids)} unique records in ground truth data")
+        
+        # Get field hashes for these records
+        records_to_process = {}
+        for record_id in record_ids:
+            if record_id in self.data_processor.deduplicator.record_field_hashes:
+                records_to_process[record_id] = self.data_processor.deduplicator.record_field_hashes[record_id]
+            else:
+                logger.warning(f"Record ID {record_id} from ground truth not found in processed data")
+        
+        # Batch retrieve field vectors
+        self.record_embeddings = self.weaviate_manager.get_field_vectors_for_records(records_to_process)
+        
+        # Save retrieved embeddings for later use
+        self._save_record_embeddings()
+        
+        logger.info(f"Retrieved vectors for {len(self.record_embeddings)} training records")
+    
+    def prepare_training_data(self) -> Tuple[Dict[str, Dict], Dict[str, Dict], List[Tuple]]:
+        """
+        Prepare data for classifier training, separate from the full dataset classification.
+        
+        Returns:
+            Tuple of (train_records, test_records, ground_truth_pairs)
+        """
+        logger.info("Preparing training data")
+        
+        # Parse ground truth file
+        ground_truth_file = self.config.get("ground_truth_file")
+        ground_truth_pairs = self.data_processor.parse_ground_truth(ground_truth_file)
+        
+        # Initialize imputer for training data
+        training_imputer = NullValueImputer(self.config, self.weaviate_manager)
+        
+        # Collect records for training
+        all_records = {}
+        for left_id, right_id, _ in ground_truth_pairs:
+            # Get record hashes
+            for record_id in [left_id, right_id]:
+                if record_id not in all_records and record_id in self.data_processor.deduplicator.record_field_hashes:
+                    field_hashes = self.data_processor.deduplicator.record_field_hashes[record_id]
+                    
+                    # Reconstruct record from field hashes
+                    record = self._reconstruct_record_from_hashes(record_id, field_hashes)
+                    
+                    if record:
+                        # Apply imputation if needed
+                        if record_id in self.record_embeddings:
+                            record_embeddings = self.record_embeddings[record_id]
+                            for field in training_imputer.imputable_fields:
+                                if not record.get(field) or pd.isna(record.get(field)):
+                                    record = training_imputer.impute_null_fields(record, record_embeddings)
+                                    break
+                        
+                        all_records[record_id] = record
+        
+        logger.info(f"Collected {len(all_records)} records for training")
+        
+        # Create train/test split
+        from sklearn.model_selection import train_test_split
+        
+        train_pairs, test_pairs = train_test_split(
+            ground_truth_pairs,
+            test_size=0.2,
+            random_state=42,
+            stratify=[int(is_match) for _, _, is_match in ground_truth_pairs]
+        )
+        
+        train_ids = set()
+        for left_id, right_id, _ in train_pairs:
+            train_ids.add(left_id)
+            train_ids.add(right_id)
+            
+        test_ids = set()
+        for left_id, right_id, _ in test_pairs:
+            test_ids.add(left_id)
+            test_ids.add(right_id)
+            
+        train_records = {rid: all_records[rid] for rid in train_ids if rid in all_records}
+        test_records = {rid: all_records[rid] for rid in test_ids if rid in all_records}
+        
+        logger.info(f"Prepared {len(train_pairs)} training pairs, {len(test_pairs)} test pairs")
+        
+        # Save stats
+        self.stats["training_data"] = {
+            "train_pairs": len(train_pairs),
+            "test_pairs": len(test_pairs),
+            "train_records": len(train_records),
+            "test_records": len(test_records),
+            "ground_truth_total": len(ground_truth_pairs)
+        }
+        
+        return train_records, test_records, ground_truth_pairs
+    
+    def _reconstruct_record_from_hashes(self, record_id: str, field_hashes: Dict[str, str]) -> Optional[Dict]:
+        """
+        Reconstruct a record from its field hashes by looking up the original strings.
+        
+        Args:
+            record_id: ID of the record
+            field_hashes: Dictionary of field->hash mappings
+            
+        Returns:
+            Reconstructed record dictionary or None if failed
+        """
+        try:
+            record = {"id": record_id}
+            unique_strings = self.data_processor.deduplicator.unique_strings
+            
+            # Loop through each field and get its original string
+            for field, hash_value in field_hashes.items():
+                if hash_value != "NULL":
+                    record[field] = unique_strings.get(hash_value, "")
+                else:
+                    record[field] = None
+            
+            return record
+        except Exception as e:
+            logger.error(f"Error reconstructing record {record_id}: {str(e)}")
+            return None
+    
+    def run_clustering(self) -> List[Dict]:
+        """
+        Run the entity clustering pipeline on the full dataset.
+        Clearly separated from the model training stage.
+        
+        Returns:
+            List of entity clusters
+        """
+        logger.info("Running entity clustering on full dataset")
+        
+        # If we don't have vectors for the full dataset yet, retrieve them
+        if not hasattr(self, 'record_embeddings') or len(self.record_embeddings) < len(self.data_processor.deduplicator.record_field_hashes):
+            self._retrieve_vectors_for_full_dataset()
+        
+        # Get all records
+        records = []
+        for record_id in self.record_embeddings.keys():
+            field_hashes = self.data_processor.deduplicator.record_field_hashes.get(record_id)
+            if field_hashes:
+                record = self._reconstruct_record_from_hashes(record_id, field_hashes)
+                if record:
+                    records.append(record)
+        
+        logger.info(f"Clustering {len(records)} records from full dataset")
+        
+        # Build match graph
+        match_graph = self.clusterer.build_match_graph(records, self.record_embeddings)
+        
+        # Extract clusters
+        clusters = self.clusterer.extract_clusters(match_graph)
+        
+        # Save clusters
+        self.clusterer.save_clusters(clusters, os.path.join(self.output_dir, "entity_clusters.jsonl"))
+        
+        # Save stats
+        self.stats["clustering"] = {
+            "total_clusters": len(clusters),
+            "total_records_clustered": sum(cluster["size"] for cluster in clusters),
+            "average_cluster_size": sum(cluster["size"] for cluster in clusters) / len(clusters) if clusters else 0,
+            "average_confidence": sum(cluster["confidence"] for cluster in clusters) / len(clusters) if clusters else 0,
+            "llm_requests_made": self.clusterer.llm_requests_made
+        }
+        
+        return clusters
+    
+    def _retrieve_vectors_for_full_dataset(self) -> None:
+        """
+        Retrieve vectors for all records in the full dataset.
+        This is done after model training, as part of the clustering stage.
+        """
+        logger.info("Retrieving vectors for full dataset")
+        
+        # Get field hashes for all records (or up to max_records)
+        records_to_process = {}
+        max_records = self.config.get("max_records")
+        
+        for record_id, field_hashes in self.data_processor.deduplicator.record_field_hashes.items():
+            records_to_process[record_id] = field_hashes
+            if max_records and len(records_to_process) >= max_records:
+                logger.info(f"Reached maximum records limit: {max_records}")
+                break
+        
+        # Batch retrieve field vectors
+        self.record_embeddings = self.weaviate_manager.get_field_vectors_for_records(records_to_process)
+        
+        # Save retrieved embeddings
+        self._save_record_embeddings()
+        
+        logger.info(f"Retrieved vectors for {len(self.record_embeddings)} records in full dataset")
     
     def _run_stage(self, stage_func, stage_name: str) -> bool:
         """

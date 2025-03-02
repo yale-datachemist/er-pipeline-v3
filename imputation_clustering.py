@@ -1,4 +1,164 @@
-import logging
+class NullValueImputer:
+    """
+    Handles imputation of null values using vector-based methods with string-centric approach.
+    """
+    def __init__(self, config: Dict, weaviate_manager):
+        """
+        Initialize the imputer with configuration settings.
+        
+        Args:
+            config: Dictionary containing configuration parameters
+            weaviate_manager: Weaviate manager instance for vector search
+        """
+        self.config = config
+        self.weaviate_manager = weaviate_manager
+        self.imputation_cache = {}  # Cache for imputed values
+        self.imputable_fields = ["attribution", "provision", "subjects", "genres", "relatedWork"]
+        self.num_neighbors = config.get("imputation_neighbors", 10)
+    
+    def impute_null_fields(self, record: Dict, embeddings: Dict[str, List[float]]) -> Dict:
+        """
+        Impute null fields in a record using vector-based imputation, tracking original presence.
+        
+        Args:
+            record: Record dictionary
+            embeddings: Field embeddings for the record
+            
+        Returns:
+            Record with imputed values and presence tracking
+        """
+        imputed_record = record.copy()
+        
+        # Track which fields were originally present
+        original_presence = {}
+        for field in self.imputable_fields:
+            has_value = bool(record.get(field)) and not pd.isna(record.get(field))
+            original_presence[field] = has_value
+        
+        # Store original presence in the record
+        imputed_record["_original_presence"] = original_presence
+        
+        # Check each field for null values
+        for field in self.imputable_fields:
+            if not record.get(field) or pd.isna(record.get(field)):
+                imputed_value = self.impute_field(record, field, embeddings.get("record", []))
+                if imputed_value:
+                    imputed_record[field] = imputed_value
+        
+        return imputed_record
+    
+    def impute_field(self, record: Dict, field: str, record_vector: List[float]) -> Optional[str]:
+        """
+        Impute a specific null field using vector-based method with vector averaging.
+        
+        Args:
+            record: Record dictionary
+            field: Field name to impute
+            record_vector: Vector embedding of the record
+            
+        Returns:
+            Imputed value or None
+        """
+        # Check cache first
+        record_id = record.get("id")
+        cache_key = f"{record_id}_{field}"
+        
+        if cache_key in self.imputation_cache:
+            return self.imputation_cache[cache_key]
+        
+        if not record_vector:
+            logger.warning(f"No record vector available for imputation: {record_id}")
+            return self.get_default_value(field)
+        
+        # Get candidates from vector search with their vectors
+        candidates = self.weaviate_manager.get_imputation_candidates(
+            query_vector=record_vector,
+            field_type=field,
+            limit=self.num_neighbors
+        )
+        
+        if not candidates:
+            logger.warning(f"No imputation candidates found for {record_id}, field {field}")
+            return self.get_default_value(field)
+        
+        # Vector-based hot deck approach: compute average vector from candidates
+        if len(candidates) >= 2:
+            # Compute average vector from candidate vectors
+            candidate_vectors = [c["vector"] for c in candidates if "vector" in c]
+            candidate_values = [c["text"] for c in candidates if "text" in c]
+            
+            if candidate_vectors:
+                # Compute average vector
+                avg_vector = np.mean(candidate_vectors, axis=0)
+                
+                # Find closest candidate to the average vector
+                closest_idx = np.argmin([
+                    np.linalg.norm(np.array(vec) - avg_vector) 
+                    for vec in candidate_vectors
+                ])
+                
+                imputed_value = candidate_values[closest_idx]
+            else:
+                # Fallback to most frequent value
+                imputed_value = candidates[0]["text"]
+        else:
+            # Just one candidate, use its value
+            imputed_value = candidates[0]["text"]
+        
+        # Validate imputed value
+        if not self.validate_imputed_value(imputed_value, field):
+            logger.warning(f"Invalid imputed value for {record_id}, field {field}: {imputed_value}")
+            return self.get_default_value(field)
+        
+        # Store in cache
+        self.imputation_cache[cache_key] = imputed_value
+        
+        return imputed_value
+    
+    def get_default_value(self, field: str) -> str:
+        """
+        Get a default value for a field when no candidates are found.
+        
+        Args:
+            field: Field name
+            
+        Returns:
+            Default value for the field
+        """
+        defaults = {
+            "attribution": "",
+            "provision": "",
+            "subjects": "",
+            "genres": "",
+            "relatedWork": ""
+        }
+        return defaults.get(field, "")
+    
+    def validate_imputed_value(self, value: str, field: str) -> bool:
+        """
+        Validate that an imputed value is reasonable for the field.
+        
+        Args:
+            value: Imputed value
+            field: Field name
+            
+        Returns:
+            Boolean indicating validity
+        """
+        # Minimum length check
+        if not value or len(value.strip()) < 2:
+            return False
+        
+        # Field-specific validation
+        if field == "provision" and not re.search(r'\d{4}', value):
+            # Provision should typically contain a year
+            return False
+        
+        # More validation could be added for other fields
+        
+        return True
+        if len(candidates) >= 2:
+            # Compute average vector from candidate vectorsimport logging
 import numpy as np
 import pandas as pd
 import json

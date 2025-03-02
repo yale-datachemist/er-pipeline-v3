@@ -38,6 +38,8 @@ class TextDeduplicator:
         # Track unique strings and their frequencies
         self.unique_strings: Dict[str, str] = {}  # hash -> original string
         self.string_counts: DefaultDict[str, int] = defaultdict(int)  # hash -> count
+        # Track field types for string-centric architecture
+        self.field_types: Dict[str, str] = {}  # hash -> field_type
         # Map record_id to field hashes
         self.record_field_hashes: Dict[str, Dict[str, str]] = {}  # record_id -> {field -> hash}
         
@@ -84,6 +86,8 @@ class TextDeduplicator:
             # Store the unique string if we haven't seen it before
             if text_hash not in self.unique_strings and text_hash != "NULL":
                 self.unique_strings[text_hash] = str(text)
+                # For string-centric architecture, track which field type this string belongs to
+                self.field_types[text_hash] = field
             
             # Increment the count for this string
             if text_hash != "NULL":
@@ -176,6 +180,10 @@ class TextDeduplicator:
         with open(os.path.join(checkpoint_dir, "string_counts.json"), 'w') as f:
             json.dump(self.string_counts, f)
             
+        # Save field types (for string-centric architecture)
+        with open(os.path.join(checkpoint_dir, "field_types.json"), 'w') as f:
+            json.dump(self.field_types, f)
+            
         # Save record field hashes (might be large, consider chunking)
         with open(os.path.join(checkpoint_dir, "record_field_hashes.json"), 'w') as f:
             json.dump(self.record_field_hashes, f)
@@ -199,10 +207,28 @@ class TextDeduplicator:
             # Load string counts
             with open(os.path.join(checkpoint_dir, "string_counts.json"), 'r') as f:
                 self.string_counts = defaultdict(int, json.load(f))
+            
+            # Load field types (for string-centric architecture)
+            field_types_path = os.path.join(checkpoint_dir, "field_types.json")
+            if os.path.exists(field_types_path):
+                with open(field_types_path, 'r') as f:
+                    self.field_types = json.load(f)
+            else:
+                # If field_types.json doesn't exist (backward compatibility),
+                # generate field types from record_field_hashes
+                logger.warning("field_types.json not found, generating from record_field_hashes")
+                self.field_types = {}
                 
             # Load record field hashes
             with open(os.path.join(checkpoint_dir, "record_field_hashes.json"), 'r') as f:
                 self.record_field_hashes = json.load(f)
+                
+                # If field_types is empty, populate it from record_field_hashes
+                if not self.field_types:
+                    for record_id, field_hash_map in self.record_field_hashes.items():
+                        for field, hash_value in field_hash_map.items():
+                            if hash_value != "NULL":
+                                self.field_types[hash_value] = field
                 
             logger.info(f"Loaded checkpoint with {len(self.unique_strings)} unique strings")
             return True
