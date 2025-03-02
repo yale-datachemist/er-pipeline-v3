@@ -568,7 +568,7 @@ class EntityResolutionPipeline:
             record = self.weaviate_manager.get_record_by_id(record_id)
             if record:
                 all_records[record_id] = record
-        
+                
         # Create train/test split
         from sklearn.model_selection import train_test_split
         
@@ -1446,6 +1446,7 @@ class EntityResolutionPipeline:
             # Get record hashes
             for record_id in [left_id, right_id]:
                 if record_id not in all_records and record_id in self.data_processor.deduplicator.record_field_hashes:
+                    
                     field_hashes = self.data_processor.deduplicator.record_field_hashes[record_id]
                     
                     # Reconstruct record from field hashes

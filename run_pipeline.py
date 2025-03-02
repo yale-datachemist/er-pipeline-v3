@@ -315,6 +315,7 @@ def main():
             pipeline_instance.index_strings()
             
             train_records, test_records, ground_truth_pairs = pipeline_instance.prepare_training_data()
+            
             pipeline_instance.train_classifier(train_records, test_records, ground_truth_pairs)
             
             pipeline_instance.initialize_imputer_clusterer()

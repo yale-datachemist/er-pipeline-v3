@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple, Optional, Set, Any, Iterable
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType, Tokenization
 from weaviate.collections import Collection
-from weaviate.classes.query import Filter
+from weaviate.classes.query import Filter, MetadataQuery
 from tqdm import tqdm
 
 # Configure logging
@@ -456,7 +456,7 @@ class WeaviateManager:
                 # Get the string from UniqueStrings collection
                 string_collection = self.client.collections.get("UniqueStrings")
                 string_result = string_collection.query.fetch_objects(
-                    filters=string_collection.query.filter.by_property("hash").equal(hash_value),
+                    filters=string_collection.Filter.by_property("hash").equal(hash_value),
                     limit=1
                 )
                 
@@ -660,7 +660,7 @@ class WeaviateManager:
             query = collection.query.near_vector(
                 near_vector=query_vector,
                 limit=limit,
-                return_metadata=Configure.return_metadata(distance=True),
+                return_metadata=MetadataQuery(distance=True),
                 include_vector=True
             )
             
