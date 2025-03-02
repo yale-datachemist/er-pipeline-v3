@@ -362,26 +362,81 @@ class EntityResolutionPipeline:
     
     def generate_embeddings(self) -> None:
         """
-        Generate embeddings for unique strings.
+        Generate embeddings for unique strings with direct checkpoint file access.
+        This version bypasses the data_processor loading mechanism for better reliability.
         """
-        logger.info("Generating embeddings")
+        logger.info("Starting embedding generation with direct checkpoint access")
         
-        # Try to load from cache first
+        # Define checkpoint directory
+        checkpoint_dir = os.path.join(self.output_dir, "checkpoints")
+        
+        # Direct loading of unique strings from file
+        unique_strings_path = os.path.join(checkpoint_dir, "unique_strings.json")
+        if not os.path.exists(unique_strings_path):
+            logger.error(f"Unique strings file not found: {unique_strings_path}")
+            raise FileNotFoundError(f"Unique strings file not found: {unique_strings_path}")
+        
+        try:
+            logger.info(f"Loading unique strings directly from: {unique_strings_path}")
+            with open(unique_strings_path, 'r') as f:
+                unique_strings = json.load(f)
+            logger.info(f"Loaded {len(unique_strings)} unique strings directly from file")
+        except Exception as e:
+            logger.error(f"Error loading unique strings file: {str(e)}")
+            raise RuntimeError(f"Failed to load unique strings: {str(e)}")
+        
+        if not unique_strings:
+            logger.error("No unique strings found in file. Preprocessing may have failed.")
+            raise ValueError("Empty unique strings file. Run preprocessing again.")
+        
+        # Try to load existing embeddings from cache
         embedding_cache = os.path.join(self.output_dir, "embeddings.npz")
-        if os.path.exists(embedding_cache) and self.config.get("use_cached_embeddings", True):
-            logger.info("Loading embeddings from cache")
-            self.embedding_generator.load_embeddings(embedding_cache)
-        else:
-            # Generate new embeddings
-            unique_strings = self.data_processor.deduplicator.unique_strings
-            
-            embeddings = self.embedding_generator.generate_embeddings_for_unique_strings(unique_strings)
-            self.embedding_generator.save_embeddings(embedding_cache)
+        cache_loaded = False
         
-        # Save stats
-        self.stats["embeddings"] = {
-            "total_embeddings": len(self.embedding_generator.embeddings)
-        }
+        if os.path.exists(embedding_cache) and self.config.get("use_cached_embeddings", True):
+            logger.info(f"Loading embeddings from cache: {embedding_cache}")
+            cache_loaded = self.embedding_generator.load_embeddings(embedding_cache)
+            logger.info(f"Loaded {len(self.embedding_generator.embeddings)} embeddings from cache")
+        
+        # Determine which strings need embedding
+        missing_strings = {}
+        for hash_key, string_value in unique_strings.items():
+            if hash_key not in self.embedding_generator.embeddings:
+                missing_strings[hash_key] = string_value
+        
+        logger.info(f"Need to generate embeddings for {len(missing_strings)} strings")
+        
+        if missing_strings:
+            # Validate OpenAI API key
+            if not self.check_openai_api_key():
+                logger.error("Cannot generate embeddings without a valid OpenAI API key")
+                raise ValueError("Missing or invalid OpenAI API key")
+            
+            # Generate new embeddings
+            logger.info(f"Generating embeddings using OpenAI API")
+            try:
+                # Add some sample strings for debugging
+                sample_keys = list(missing_strings.keys())[:3]
+                if sample_keys:
+                    logger.info(f"Sample strings to embed (first 3):")
+                    for key in sample_keys:
+                        logger.info(f"  - {key[:8]}: {missing_strings[key][:50]}...")
+                
+                # Actually generate the embeddings
+                new_embeddings = self.embedding_generator.generate_embeddings_for_unique_strings(missing_strings)
+                logger.info(f"Successfully generated {len(new_embeddings)} new embeddings")
+                
+                # Save updated embeddings
+                self.embedding_generator.save_embeddings(embedding_cache)
+            except Exception as e:
+                logger.error(f"Error generating embeddings: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                raise
+        elif not self.embedding_generator.embeddings:
+            logger.warning("No embeddings loaded from cache and no new strings to embed")
+        else:
+            logger.info("All strings already have embeddings in cache, no need to generate new ones")
     
     def setup_weaviate(self) -> None:
         """
