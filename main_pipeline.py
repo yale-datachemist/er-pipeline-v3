@@ -1,68 +1,4 @@
-    def _load_config(self, config_path: str) -> Dict:
-        """
-        Load configuration from a YAML file with environment-specific scaling parameters.
-        
-        Args:
-            config_path: Path to the configuration file
-            
-        Returns:
-            Configuration dictionary
-        """
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
-        
-        # Set environment-specific defaults
-        mode = config.get("mode", "dev")
-        
-        # Apply environment-specific settings based on mode
-        env_settings = None
-        if mode == "dev":
-            env_type = "development"
-            config.setdefault("max_records", 10000)
-            config.setdefault("checkpoint_frequency", 10)
-        else:  # production mode
-            env_type = "production"
-            config.setdefault("max_records", None)  # Process all records
-            config.setdefault("checkpoint_frequency", 50)
-        
-        # Apply environment scaling parameters if available
-        if "environment" in config and env_type in config["environment"]:
-            env_settings = config["environment"][env_type]
-            
-            # Update batch sizes
-            if "batch_sizes" in env_settings:
-                batch_sizes = env_settings["batch_sizes"]
-                if "embedding" in batch_sizes:
-                    config["embedding_batch_size"] = batch_sizes["embedding"]
-                if "weaviate" in batch_sizes:
-                    config["weaviate_batch_size"] = batch_sizes["weaviate"]
-                if "graph" in batch_sizes:
-                    config["graph_batch_size"] = batch_sizes["graph"]
-            
-            # Update parallelism
-            if "parallelism" in env_settings:
-                config["embedding_workers"] = env_settings["parallelism"]
-            
-            # Update memory limits
-            if "memory_limits" in env_settings:
-                for key, value in env_settings["memory_limits"].items():
-                    config[key] = value
-            
-            # Update vector index parameters for Weaviate
-            if "vector_index_params" in env_settings:
-                config["vector_index_params"] = env_settings["vector_index_params"]
-            
-            # Update Weaviate resource limits (for Docker Compose)
-            if "weaviate_resources" in env_settings:
-                config["weaviate_resources"] = env_settings["weaviate_resources"]
-            
-            logger.info(f"Applied {env_type} environment scaling parameters")
-        
-        # Add checkpointing settings
-        config.setdefault("enable_checkpointing", True)
-        config.setdefault("checkpoint_after_stage", True)
-        
-        return configimport os
+import os
 import json
 import logging
 import argparse
@@ -159,7 +95,7 @@ class EntityResolutionPipeline:
     
     def _load_config(self, config_path: str) -> Dict:
         """
-        Load configuration from a YAML file.
+        Load configuration from a YAML file with environment-specific scaling parameters.
         
         Args:
             config_path: Path to the configuration file
@@ -173,22 +109,49 @@ class EntityResolutionPipeline:
         # Set environment-specific defaults
         mode = config.get("mode", "dev")
         
+        # Apply environment-specific settings based on mode
+        env_settings = None
         if mode == "dev":
+            env_type = "development"
             config.setdefault("max_records", 10000)
             config.setdefault("checkpoint_frequency", 10)
-            config.setdefault("embedding_batch_size", 50)
-            config.setdefault("weaviate_batch_size", 100)
-            config.setdefault("max_neighbors", 20)
-            config.setdefault("max_llm_requests", 50)
-            config.setdefault("graph_batch_size", 1000)  # For memory-efficient graph building
         else:  # production mode
+            env_type = "production"
             config.setdefault("max_records", None)  # Process all records
             config.setdefault("checkpoint_frequency", 50)
-            config.setdefault("embedding_batch_size", 100)
-            config.setdefault("weaviate_batch_size", 500)
-            config.setdefault("max_neighbors", 50)
-            config.setdefault("max_llm_requests", 1000)
-            config.setdefault("graph_batch_size", 5000)  # For memory-efficient graph building
+        
+        # Apply environment scaling parameters if available
+        if "environment" in config and env_type in config["environment"]:
+            env_settings = config["environment"][env_type]
+            
+            # Update batch sizes
+            if "batch_sizes" in env_settings:
+                batch_sizes = env_settings["batch_sizes"]
+                if "embedding" in batch_sizes:
+                    config["embedding_batch_size"] = batch_sizes["embedding"]
+                if "weaviate" in batch_sizes:
+                    config["weaviate_batch_size"] = batch_sizes["weaviate"]
+                if "graph" in batch_sizes:
+                    config["graph_batch_size"] = batch_sizes["graph"]
+            
+            # Update parallelism
+            if "parallelism" in env_settings:
+                config["embedding_workers"] = env_settings["parallelism"]
+            
+            # Update memory limits
+            if "memory_limits" in env_settings:
+                for key, value in env_settings["memory_limits"].items():
+                    config[key] = value
+            
+            # Update vector index parameters for Weaviate
+            if "vector_index_params" in env_settings:
+                config["vector_index_params"] = env_settings["vector_index_params"]
+            
+            # Update Weaviate resource limits (for Docker Compose)
+            if "weaviate_resources" in env_settings:
+                config["weaviate_resources"] = env_settings["weaviate_resources"]
+            
+            logger.info(f"Applied {env_type} environment scaling parameters")
         
         # Add checkpointing settings
         config.setdefault("enable_checkpointing", True)
