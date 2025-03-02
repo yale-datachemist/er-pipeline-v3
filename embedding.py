@@ -47,6 +47,9 @@ class EmbeddingGenerator:
         self.token_counts = []
         self.daily_token_count = 0
         self.daily_reset_time = time.time()
+        
+        # Add verbose_logging attribute
+        self.verbose_logging = config.get("verbose_logging", True)
     
     def _check_rate_limits(self, estimated_tokens: int) -> bool:
         """
@@ -269,15 +272,14 @@ class EmbeddingGenerator:
             return {}
         
         # Log some sample texts for debugging
-        if self.verbose_logging:
-            sample_size = min(3, len(texts))
-            logger.info(f"Sample texts for embedding (first {sample_size}):")
-            for i in range(sample_size):
-                logger.info(f"  - [{i}] {texts[i][:100]}")
+        sample_size = min(3, len(texts))
+        logger.info(f"Sample texts for embedding (first {sample_size}):")
+        for i in range(sample_size):
+            logger.info(f"  - [{i}] {texts[i][:100]}")
         
         # Process in parallel batches
         max_workers = self.config.get("embedding_workers", 4)
-        chunk_size = max(1, len(texts) // max_workers)
+        chunk_size = max(1, len(texts) // max_workers)        
         
         try:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
