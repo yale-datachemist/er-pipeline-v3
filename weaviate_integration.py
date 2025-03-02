@@ -1,44 +1,4 @@
-    def get_imputation_candidates(self, query_vector: List[float], field: str, limit: int = 10) -> List[str]:
-        """
-        Get candidate values for imputing a missing field.
-        
-        Args:
-            query_vector: Query vector embedding
-            field: Field to impute
-            limit: Maximum number of results
-            
-        Returns:
-            List of candidate values
-        """
-        if not self.client:
-            logger.error("Not connected to Weaviate")
-            return []
-            
-        try:
-            collection = self.client.collections.get("EntityRecord")
-            
-            # Perform vector search, only retrieving records where the field is not empty
-            result = collection.query.near_vector(
-                near_vector=query_vector,
-                limit=limit * 2,  # Request more to account for filtering
-                return_metadata=Configure.return_metadata(distance=True),
-                return_properties=["id", field]
-            )
-            
-            # Filter out empty values and take up to the limit
-            candidates = []
-            for obj in result.objects:
-                field_value = obj.properties.get(field)
-                if field_value and field_value.strip():
-                    candidates.append(field_value)
-                    if len(candidates) >= limit:
-                        break
-            
-            return candidates
-            
-        except Exception as e:
-            logger.error(f"Error getting imputation candidates: {str(e)}")
-            return []import logging
+import logging
 import time
 import json
 import numpy as np
