@@ -5,6 +5,7 @@ import json
 import signal
 import atexit
 import gc
+import pickle
 from datetime import datetime
 from main_pipeline import EntityResolutionPipeline
 from logging_setup import setup_logging, _log_handlers  # Import the new logging setup

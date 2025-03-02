@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple, Optional, Set, Any, Iterable
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType, Tokenization
 from weaviate.collections import Collection
+from weaviate.classes.query import Filter
 from tqdm import tqdm
 
 # Configure logging
@@ -570,7 +571,7 @@ class WeaviateManager:
                 collection = self.client.collections.get("UniqueStrings")
                 
                 # Build filter for batch of hashes
-                hash_filter = collection.query.filter.by_property("hash").contains_any(batch_hashes)
+                hash_filter = Filter.by_property("hash").contains_any(batch_hashes)
                 
                 # Execute query
                 result = collection.query.fetch_objects(
