@@ -4,15 +4,44 @@ import sys
 import json
 import signal
 import atexit
+import gc
 from datetime import datetime
 from main_pipeline import EntityResolutionPipeline
-from logging_setup import setup_logging  # Import the new logging setup function
+from logging_setup import setup_logging, _log_handlers  # Import the new logging setup
 
 # Set up logging with proper handler management
 logger = setup_logging()
 
 # Global reference to pipeline for cleanup handlers
 pipeline_instance = None
+
+def force_close_logging():
+    """Force close all logging handlers to prevent ResourceWarnings."""
+    import logging
+    
+    # Flush and close all handlers in the root logger
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        try:
+            handler.flush()
+            handler.close()
+            root_logger.removeHandler(handler)
+        except Exception:
+            pass
+    
+    # Also close our tracked handlers
+    for handler in _log_handlers:
+        try:
+            handler.flush()
+            handler.close()
+        except Exception:
+            pass
+    
+    # Clear the handlers list
+    _log_handlers.clear()
+    
+    # Force garbage collection to release file handles
+    gc.collect()
 
 def cleanup_handler():
     """Handle cleanup when the program exits."""
@@ -29,6 +58,9 @@ def cleanup_handler():
                 pipeline_instance.weaviate_manager.close()
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
+    
+    # Force close all logging handlers at the end
+    force_close_logging()
 
 def signal_handler(sig, frame):
     """Handle interruption signals to ensure clean exit."""
@@ -304,4 +336,8 @@ def main():
             cleanup_handler()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # Ensure logging handlers are properly closed even if there's an exception
+        force_close_logging()
