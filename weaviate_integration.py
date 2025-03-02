@@ -183,7 +183,7 @@ class WeaviateManager:
     
     def setup_collections(self) -> bool:
         """
-        Set up the required collections in Weaviate.
+        Set up the required collections in Weaviate with robust existence checking.
         
         Returns:
             Boolean indicating success
@@ -193,60 +193,87 @@ class WeaviateManager:
             return False
                 
         try:
-            # Check if collections already exist
-            logger.info("Retrieving existing collections from Weaviate")
-            existing_collections = self.client.collections.list_all()
-            
-            # Handle different return types based on Weaviate client version
-            if isinstance(existing_collections, list):
-                # In newer versions, this might be a list of Collection objects
+            # Check if collections already exist - using direct schema endpoint for reliability
+            try:
+                logger.info("Checking existing collections using schema endpoint")
+                schema = self.client._connection.get("/v1/schema")
+                existing_classes = [cls["class"] for cls in schema.get("classes", [])]
+                logger.info(f"Found existing collections via schema: {existing_classes}")
+            except Exception as schema_e:
+                logger.warning(f"Error checking schema directly: {schema_e}")
+                # Fall back to list_all method
+                logger.info("Falling back to collections.list_all()")
                 try:
-                    existing_names = [c.name for c in existing_collections]
-                    logger.info(f"Found existing collections: {existing_names}")
-                except AttributeError:
-                    # If the items don't have name attribute, they might be strings
-                    existing_names = existing_collections
-                    logger.info(f"Found existing collections (string format): {existing_names}")
-            else:
-                # In some versions, this might be something else
-                logger.warning(f"Unexpected type for collections list: {type(existing_collections)}")
-                existing_names = []
-            
+                    existing_collections = self.client.collections.list_all()
+                    
+                    # Handle different return types based on Weaviate client version
+                    if isinstance(existing_collections, list):
+                        try:
+                            existing_names = [c.name for c in existing_collections]
+                        except AttributeError:
+                            # If the items don't have name attribute, they might be strings
+                            existing_names = existing_collections
+                    else:
+                        existing_names = []
+                        
+                    logger.info(f"Found existing collections via list_all: {existing_names}")
+                    existing_classes = existing_names
+                except Exception as list_e:
+                    logger.warning(f"Error using list_all: {list_e}")
+                    # Assume no collections exist if we can't check
+                    existing_classes = []
+                    
             # Get vector index configuration based on environment
             hnsw_config = self._get_vector_index_config()
             
             # Setup UniqueStrings collection
-            if "UniqueStrings" not in existing_names:
+            if "UniqueStrings" not in existing_classes:
                 logger.info("Creating collection: UniqueStrings")
-                
-                self.client.collections.create(
-                    name="UniqueStrings",
-                    description="Collection for storing unique text strings and their vectors",
-                    vectorizer_config=Configure.Vectorizer.none(),
-                    properties=self.unique_strings_properties,
-                    vector_index_config=hnsw_config
-                )
-                    
-                logger.info("Created collection: UniqueStrings")
+                try:
+                    self.client.collections.create(
+                        name="UniqueStrings",
+                        description="Collection for storing unique text strings and their vectors",
+                        vectorizer_config=Configure.Vectorizer.none(),
+                        properties=self.unique_strings_properties,
+                        vector_index_config=hnsw_config
+                    )
+                    logger.info("Created collection: UniqueStrings")
+                except Exception as e:
+                    if "already exists" in str(e):
+                        logger.info("Collection UniqueStrings already exists (caught from error)")
+                    else:
+                        raise
             else:
                 logger.info("Collection already exists: UniqueStrings")
             
             # Setup EntityMap collection (optional)
-            if "EntityMap" not in existing_names:
+            if "EntityMap" not in existing_classes:
                 logger.info("Creating collection: EntityMap")
-                
-                self.client.collections.create(
-                    name="EntityMap",
-                    description="Collection for mapping entities to their component strings",
-                    vectorizer_config=Configure.Vectorizer.none(),  # No vectors needed
-                    properties=self.entity_map_properties
-                )
-                    
-                logger.info("Created collection: EntityMap")
+                try:
+                    self.client.collections.create(
+                        name="EntityMap",
+                        description="Collection for mapping entities to their component strings",
+                        vectorizer_config=Configure.Vectorizer.none(),  # No vectors needed
+                        properties=self.entity_map_properties
+                    )
+                    logger.info("Created collection: EntityMap")
+                except Exception as e:
+                    if "already exists" in str(e):
+                        logger.info("Collection EntityMap already exists (caught from error)")
+                    else:
+                        raise
             else:
                 logger.info("Collection already exists: EntityMap")
             
-            return True
+            # Verify collections exist
+            try:
+                unique_strings_collection = self.client.collections.get("UniqueStrings")
+                entity_map_collection = self.client.collections.get("EntityMap")
+                logger.info("Successfully verified collections exist")
+                return True
+            except Exception as e:
+                logger.error(f"Error verifying collections: {e}")
+                return False
                 
         except Exception as e:
             logger.error(f"Error setting up collections: {str(e)}")
