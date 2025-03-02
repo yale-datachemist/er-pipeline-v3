@@ -3,6 +3,7 @@ import atexit
 from datetime import datetime
 import os
 import sys
+import pickle
 
 def setup_logging(log_dir=None):
     """
