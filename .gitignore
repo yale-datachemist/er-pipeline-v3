@@ -1,5 +1,6 @@
 .DS_Store
 .env
+*.logging
 __pycache__
 checkpoints
 data
