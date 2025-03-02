@@ -1,0 +1,44 @@
+2025-03-02 15:33:03,440 - logging_setup - INFO - Logging initialized. Log file: entity_resolution_20250302_153303.log
+2025-03-02 15:33:03,445 - logging_setup - INFO - Applied development environment scaling parameters
+2025-03-02 15:33:03,477 - logging_setup - INFO - Pipeline initialized with config from config.yml
+2025-03-02 15:33:03,477 - logging_setup - INFO - Mode: dev
+2025-03-02 15:33:03,478 - logging_setup - INFO - Output directory: output
+2025-03-02 15:33:03,478 - logging_setup - INFO - Starting preprocessing
+2025-03-02 15:33:03,478 - preprocessing - INFO - Running preprocessing in dev mode
+2025-03-02 15:33:03,478 - preprocessing - INFO - Using CSV delimiter: ','
+2025-03-02 15:33:03,478 - preprocessing - INFO - Creating development subset from data
+2025-03-02 15:33:03,478 - preprocessing - INFO - Preparing development subset with 10000 records
+2025-03-02 15:33:03,618 - preprocessing - INFO - Saved development subset with 10000 records
+2025-03-02 15:33:03,619 - preprocessing - INFO - Processing directory: dev_data
+2025-03-02 15:33:03,619 - preprocessing - INFO - Found 2 CSV files in dev_data: ['dev_subset.csv', 'benchmark_data_records.csv']
+2025-03-02 15:33:03,619 - preprocessing - INFO - Processing file: dev_data/dev_subset.csv
+2025-03-02 15:33:03,760 - preprocessing - INFO - Processed 10000 records from dev_data/dev_subset.csv
+2025-03-02 15:33:03,760 - preprocessing - INFO - Processing file: dev_data/benchmark_data_records.csv
+2025-03-02 15:33:03,836 - preprocessing - INFO - Processed 2354 records from dev_data/benchmark_data_records.csv
+2025-03-02 15:33:03,837 - preprocessing - INFO - Completed processing 2 files with 12354 records
+2025-03-02 15:33:03,865 - preprocessing - INFO - Saved checkpoint with 8794 unique strings
+2025-03-02 15:33:03,866 - preprocessing - INFO - Preprocessing statistics: {
+  "total_records": 2354,
+  "total_unique_strings": 8794,
+  "total_strings": 16626,
+  "duplication_ratio": 0.47106940935883557,
+  "null_counts": {
+    "genres": 1378,
+    "relatedWork": 2006,
+    "attribution": 815,
+    "subjects": 330,
+    "provision": 31
+  }
+}
+2025-03-02 15:33:03,866 - preprocessing - INFO - Successfully processed 2354 records with 8794 unique strings
+2025-03-02 15:33:03,866 - logging_setup - INFO - Pipeline execution completed
+2025-03-02 15:33:03,866 - logging_setup - INFO - Running cleanup during program exit
+2025-03-02 15:33:03,866 - logging_setup - INFO - Performing cleanup operations
+2025-03-02 15:33:03,866 - logging_setup - INFO - Weaviate connection closed
+2025-03-02 15:33:03,866 - logging_setup - INFO - OpenAI client connection closed
+2025-03-02 15:33:03,893 - logging_setup - INFO - Cleanup completed
+2025-03-02 15:33:03,893 - logging_setup - INFO - Running cleanup during program exit
+2025-03-02 15:33:03,893 - logging_setup - INFO - Performing cleanup operations
+2025-03-02 15:33:03,893 - logging_setup - INFO - Weaviate connection closed
+2025-03-02 15:33:03,893 - logging_setup - INFO - OpenAI client connection closed
+2025-03-02 15:33:03,915 - logging_setup - INFO - Cleanup completed
