@@ -456,7 +456,7 @@ class WeaviateManager:
                 # Get the string from UniqueStrings collection
                 string_collection = self.client.collections.get("UniqueStrings")
                 string_result = string_collection.query.fetch_objects(
-                    filters=string_collection.Filter.by_property("hash").equal(hash_value),
+                    filters=Filter.by_property("hash").equal(hash_value),
                     limit=1
                 )
                 
@@ -493,7 +493,7 @@ class WeaviateManager:
             
             # Query by entity_id for exact match
             result = collection.query.fetch_objects(
-                filters=collection.Filter.by_property("entity_id").equal(entity_id),
+                filters=Filter.by_property("entity_id").equal(entity_id),
                 limit=1
             )
             
@@ -531,7 +531,7 @@ class WeaviateManager:
             
             # Query by hash for exact match
             result = collection.query.fetch_objects(
-                filters=collection.Filter.by_property("hash").equal(hash_value),
+                filters=Filter.by_property("hash").equal(hash_value),
                 limit=1,
                 include_vector=True
             )
@@ -581,10 +581,10 @@ class WeaviateManager:
                 # Build filter for batch of hashes - use Weaviate's contains_any operator
                 if len(batch_hashes) == 1:
                     # For a single hash, use equals
-                    hash_filter = collection.Filter.by_property("hash").equal(batch_hashes[0])
+                    hash_filter = Filter.by_property("hash").equal(batch_hashes[0])
                 else:
                     # For multiple hashes, use contains_any
-                    hash_filter = collection.Filter.by_property("hash").contains_any(batch_hashes)
+                    hash_filter = Filter.by_property("hash").contains_any(batch_hashes)
                 
                 # Execute query
                 result = collection.query.fetch_objects(
