@@ -50,13 +50,13 @@ weaviate_retry_count: 3
 # Feature engineering settings
 field_weights:
   person: 1.0
-  roles: 0.7
-  title: 0.9
-  attribution: 0.8
+  roles: 0.5
+  title: 0.8
+  attribution: 0.5
   provision: 0.6
-  subjects: 0.7
+  subjects: 0.9
   genres: 0.5
-  relatedWork: 0.6
+  relatedWork: 0.5
   record: 0.8
 
 # Classifier settings
@@ -70,7 +70,7 @@ grad_clip_threshold: 5.0
 imputation_neighbors: 10
 
 # Clustering settings
-match_threshold: 0.7
+match_threshold: 0.55
 min_cluster_size: 1
 max_neighbors: 500
 graph_batch_size: 1000  # Records per batch for graph building

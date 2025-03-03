@@ -106,7 +106,7 @@ class ClassificationReporter:
         Returns:
             DataFrame containing feature vectors and metadata
         """
-        if not self.report_data["feature_vectors"] or not self.report_data["feature_names"]:
+        if len(self.report_data["feature_vectors"]) == 0 or len(self.report_data["feature_names"]) == 0:
             logger.warning("No feature vectors or names available for reporting")
             return pd.DataFrame()
         
@@ -150,7 +150,7 @@ class ClassificationReporter:
         Returns:
             DataFrame with feature statistics
         """
-        if not self.report_data["feature_vectors"] or not self.report_data["feature_names"]:
+        if len(self.report_data["feature_vectors"]) == 0 or len(self.report_data["feature_names"]) == 0:
             logger.warning("No feature vectors or names available for statistics")
             return pd.DataFrame()
         
@@ -216,13 +216,13 @@ class ClassificationReporter:
         Returns:
             Dictionary of performance metrics
         """
-        if not self.report_data["true_labels"]:
+        if len(self.report_data["true_labels"]) == 0:
             logger.warning("No labels available for performance metrics")
             return {}
             
-        if "prediction_probs" not in self.report_data or not self.report_data["prediction_probs"]:
+        if "prediction_probs" not in self.report_data or not len(self.report_data["prediction_probs"]) == 0:
             logger.warning("No prediction probabilities available for threshold analysis")
-            if not self.report_data["predictions"]:
+            if not len(self.report_data["predictions"]) == 0:
                 return {}
             # Use predictions at default threshold only
             metrics = self._calculate_metrics_at_threshold(
@@ -302,7 +302,7 @@ class ClassificationReporter:
         Returns:
             DataFrame containing error analysis
         """
-        if not self.report_data["true_labels"] or not self.report_data["predictions"]:
+        if len(self.report_data["true_labels"]) == 0 or len(self.report_data["predictions"]) == 0:
             logger.warning("Missing true labels or predictions for error analysis")
             return pd.DataFrame()
         
@@ -330,7 +330,7 @@ class ClassificationReporter:
         misclassified = feature_df[feature_df["true_label"] != feature_df["predicted_label"]]
         
         # Add error type
-        misclassified["error_type"] = misclassified.apply(
+        misclassified.loc[:, "error_type"] = misclassified.apply(
             lambda x: "False Positive" if x["true_label"] == 0 else "False Negative", 
             axis=1
         )
@@ -350,7 +350,7 @@ class ClassificationReporter:
         Args:
             top_n: Number of top features to plot
         """
-        if not self.report_data["feature_vectors"] or not self.report_data["feature_names"]:
+        if len(self.report_data["feature_vectors"]) == 0 or len(self.report_data["feature_names"]) == 0:
             logger.warning("No feature vectors or names available for plotting")
             return
         
@@ -397,7 +397,7 @@ class ClassificationReporter:
         Args:
             normalize: Whether to normalize by row
         """
-        if not self.report_data["true_labels"] or not self.report_data["predictions"]:
+        if len(self.report_data["true_labels"]) == 0 or len(self.report_data["predictions"]) == 0:
             logger.warning("Missing true labels or predictions for confusion matrix")
             return
         
@@ -465,7 +465,7 @@ class ClassificationReporter:
         """
         Plot ROC curve.
         """
-        if not self.report_data["true_labels"] or "prediction_probs" not in self.report_data:
+        if len(self.report_data["true_labels"]) == 0 or "prediction_probs" not in self.report_data:
             logger.warning("Missing true labels or prediction probabilities for ROC curve")
             return
         
@@ -494,7 +494,7 @@ class ClassificationReporter:
         """
         Plot precision-recall curve.
         """
-        if not self.report_data["true_labels"] or "prediction_probs" not in self.report_data:
+        if len(self.report_data["true_labels"]) == 0 or "prediction_probs" not in self.report_data:
             logger.warning("Missing true labels or prediction probabilities for PR curve")
             return
         
@@ -528,7 +528,7 @@ class ClassificationReporter:
         Args:
             top_n: Number of top features to include
         """
-        if not self.report_data["feature_vectors"] or not self.report_data["feature_names"]:
+        if len(self.report_data["feature_vectors"]) == 0 or len(self.report_data["feature_names"]) == 0:
             logger.warning("No feature vectors or names available for correlation plot")
             return
         
@@ -569,7 +569,7 @@ class ClassificationReporter:
             method: Dimensionality reduction method ('pca' or 'tsne')
             n_components: Number of components for reduction
         """
-        if not self.report_data["feature_vectors"] or not self.report_data["true_labels"]:
+        if not len(self.report_data["feature_vectors"]) == 0 or not len(self.report_data["true_labels"]) == 0:
             logger.warning("No feature vectors or labels available for visualization")
             return
         
@@ -645,9 +645,9 @@ class ClassificationReporter:
         
         # Prepare summary data
         summary = {
-            "dataset_size": len(self.report_data["true_labels"]) if self.report_data["true_labels"] else 0,
-            "feature_count": len(self.report_data["feature_names"]) if self.report_data["feature_names"] else 0,
-            "positive_count": sum(self.report_data["true_labels"]) if self.report_data["true_labels"] else 0,
+            "dataset_size": len(self.report_data["true_labels"]) if len(self.report_data["true_labels"]) != 0 else 0,
+            "feature_count": len(self.report_data["feature_names"]) if len(self.report_data["feature_names"]) != 0 else 0,
+            "positive_count": sum(self.report_data["true_labels"]) if len(self.report_data["true_labels"]) != 0 else 0,
             "top_features": feature_stats.head(10).to_dict(orient='records') if not feature_stats.empty else [],
             "performance": performance_metrics.get(0.5, {}) if isinstance(performance_metrics, dict) else {},
             "error_count": len(error_analysis) if not error_analysis.empty else 0,
