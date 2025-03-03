@@ -640,6 +640,7 @@ class EntityResolutionPipeline:
                   ground_truth_pairs: List[Tuple]) -> None:
         """
         Train and evaluate the classifier, and perform clustering on the training data.
+        With corrected train/test split implementation.
         
         Args:
             train_records: Dictionary of training records
@@ -652,9 +653,51 @@ class EntityResolutionPipeline:
             logger.error("Training or test records are empty, cannot train classifier")
             return
         
-        # Create training pairs
+        # Ensure record_embeddings is loaded
+        if not hasattr(self, 'record_embeddings') or not self.record_embeddings:
+            logger.info("Loading record embeddings from checkpoint")
+            embeddings_file = os.path.join(self.checkpoint_dir, "record_embeddings.pkl")
+            if os.path.exists(embeddings_file):
+                try:
+                    with open(embeddings_file, 'rb') as f:
+                        self.record_embeddings = pickle.load(f)
+                    logger.info(f"Loaded {len(self.record_embeddings)} record embeddings from checkpoint")
+                except Exception as e:
+                    logger.error(f"Error loading record embeddings: {e}")
+                    self.record_embeddings = {}
+        
+        # Log how many of our training records have embeddings
+        train_ids = set(train_records.keys())
+        test_ids = set(test_records.keys())
+        all_ids = train_ids.union(test_ids)
+        
+        if self.record_embeddings:
+            embedding_ids = set(self.record_embeddings.keys())
+            coverage = len(embedding_ids.intersection(all_ids)) / len(all_ids) if all_ids else 0
+            logger.info(f"Record embeddings coverage: {coverage:.2%} ({len(embedding_ids.intersection(all_ids))}/{len(all_ids)})")
+            
+            if coverage < 0.9:
+                logger.warning("Low embedding coverage for training/test records")
+        else:
+            logger.error("No record embeddings available!")
+            return
+        
+        # Split ground truth pairs into training and testing sets
+        from sklearn.model_selection import train_test_split
+        
+        # Use stable stratified split with fixed random seed
+        gt_train_pairs, gt_test_pairs = train_test_split(
+            ground_truth_pairs,
+            test_size=0.2,
+            random_state=42,
+            stratify=[int(is_match) for _, _, is_match in ground_truth_pairs]
+        )
+        
+        logger.info(f"Split ground truth into {len(gt_train_pairs)} training pairs and {len(gt_test_pairs)} test pairs")
+        
+        # Create training pairs - ONLY using training records and training ground truth pairs
         train_pairs = []
-        for left_id, right_id, is_match in ground_truth_pairs:
+        for left_id, right_id, is_match in gt_train_pairs:
             if left_id in train_records and right_id in train_records:
                 train_pairs.append((train_records[left_id], train_records[right_id], is_match))
         
@@ -692,9 +735,9 @@ class EntityResolutionPipeline:
             self.classifier.save_model(os.path.join(self.output_dir, "classifier_model.pkl"))
             self.feature_engineer.save_scaler(os.path.join(self.output_dir, "feature_scaler.pkl"))
             
-            # Create test pairs
+            # Create test pairs - ONLY using test records and test ground truth pairs
             test_pairs = []
-            for left_id, right_id, is_match in ground_truth_pairs:
+            for left_id, right_id, is_match in gt_test_pairs:
                 if left_id in test_records and right_id in test_records:
                     test_pairs.append((test_records[left_id], test_records[right_id], is_match))
             
@@ -728,7 +771,7 @@ class EntityResolutionPipeline:
             training_clusters = self._cluster_training_data(train_records)
             
             # Evaluate clustering against ground truth
-            clustering_evaluation = self._evaluate_training_clusters(training_clusters, ground_truth_pairs)
+            clustering_evaluation = self._evaluate_training_clusters(training_clusters, gt_train_pairs)
             
             # Save stats
             self.stats["classifier"] = {
@@ -743,8 +786,8 @@ class EntityResolutionPipeline:
         
     def _initialize_components_for_training(self) -> None:
         """
-        Initialize imputer and clusterer components for training data clustering.
-        This is separate from the component initialization for the full dataset.
+        Initialize components needed for clustering on the training data.
+        Also shares the data_processor between components.
         """
         logger.info("Initializing components for training data clustering")
         
@@ -755,6 +798,15 @@ class EntityResolutionPipeline:
                 self.config, self.classifier, self.weaviate_manager, 
                 self.training_imputer, self.feature_engineer
             )
+            
+            # Share the data processor reference with the weaviate manager
+            if not hasattr(self.weaviate_manager, 'data_processor'):
+                self.weaviate_manager.data_processor = self.data_processor
+                
+            # Also share it with the training clusterer's weaviate manager
+            if not hasattr(self.training_clusterer.weaviate_manager, 'data_processor'):
+                self.training_clusterer.weaviate_manager.data_processor = self.data_processor
+                
             logger.info("Successfully initialized training components")
         except Exception as e:
             logger.error(f"Error initializing training components: {str(e)}")
@@ -1146,6 +1198,165 @@ class EntityResolutionPipeline:
             # Save stats to file
             with open(os.path.join(self.output_dir, "pipeline_stats.json"), 'w') as f:
                 json.dump(self.stats, f, indent=2)
+    
+    def run_pipeline_training_stage(self):
+        """
+        Run only the training stage with an explicit flow to ensure embeddings are available.
+        """
+        logger.info("Running training stage with explicit embedding retrieval")
+        
+        # 1. First, make sure we have the necessary data structures loaded
+        self._restore_checkpoint_data()
+        
+        # 2. Parse ground truth file
+        ground_truth_file = self.config.get("ground_truth_file")
+        ground_truth_pairs = self.data_processor.parse_ground_truth(ground_truth_file)
+        
+        if not ground_truth_pairs:
+            logger.error("No ground truth pairs found. Check your ground truth file format.")
+            return False
+        
+        logger.info(f"Loaded {len(ground_truth_pairs)} ground truth pairs")
+        
+        # 3. Collect all record IDs from ground truth
+        record_ids = set()
+        for left_id, right_id, _ in ground_truth_pairs:
+            record_ids.add(left_id)
+            record_ids.add(right_id)
+        
+        # 4. Check if we need to set up Weaviate
+        if not self.weaviate_manager.client:
+            logger.info("Setting up Weaviate connection")
+            if not self.weaviate_manager.connect():
+                logger.error("Failed to connect to Weaviate")
+                return False
+            
+            logger.info("Setting up Weaviate collections")
+            if not self.weaviate_manager.setup_collections():
+                logger.error("Failed to set up Weaviate collections")
+                return False
+        
+        # 5. Make sure we have embeddings generated and loaded
+        embeddings_file = os.path.join(self.output_dir, "embeddings.npz")
+        if not os.path.exists(embeddings_file):
+            logger.error(f"Embeddings file not found: {embeddings_file}")
+            logger.error("Run the embedding stage first")
+            return False
+        
+        # Load embeddings
+        if not self.embedding_generator.embeddings:
+            logger.info(f"Loading embeddings from {embeddings_file}")
+            if not self.embedding_generator.load_embeddings(embeddings_file):
+                logger.error("Failed to load embeddings")
+                return False
+        
+        # 6. Manually retrieve field embeddings for all records in ground truth
+        logger.info(f"Retrieving embeddings for {len(record_ids)} ground truth records")
+        
+        # Prepare record field hashes for retrieval
+        records_to_process = {}
+        missing_hashes = []
+        
+        for record_id in record_ids:
+            if record_id in self.data_processor.deduplicator.record_field_hashes:
+                records_to_process[record_id] = self.data_processor.deduplicator.record_field_hashes[record_id]
+            else:
+                missing_hashes.append(record_id)
+        
+        if missing_hashes:
+            logger.warning(f"Field hashes not found for {len(missing_hashes)} records")
+            if len(missing_hashes) <= 10:
+                logger.warning(f"Missing record IDs: {missing_hashes}")
+        
+        if not records_to_process:
+            logger.error("No field hashes available for ground truth records")
+            return False
+        
+        # Initialize record_embeddings if needed
+        if not hasattr(self, 'record_embeddings'):
+            self.record_embeddings = {}
+        
+        # 7. Use direct Weaviate querying to get vectors for each field hash
+        logger.info("Retrieving vectors directly from Weaviate")
+        
+        # Collect all unique hash values
+        unique_hashes = set()
+        for field_hashes in records_to_process.values():
+            for field, hash_value in field_hashes.items():
+                if hash_value != "NULL":
+                    unique_hashes.add(hash_value)
+        
+        logger.info(f"Found {len(unique_hashes)} unique field hashes to retrieve")
+        
+        # Retrieve vectors for all unique hashes
+        hash_vectors = {}
+        try:
+            hash_vectors = self.weaviate_manager.get_vectors_by_hashes(list(unique_hashes))
+            logger.info(f"Retrieved vectors for {len(hash_vectors)} unique hashes")
+        except Exception as e:
+            logger.error(f"Error retrieving vectors: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+        # Map vectors to records and fields
+        for record_id, field_hashes in records_to_process.items():
+            field_vectors = {}
+            for field, hash_value in field_hashes.items():
+                if hash_value != "NULL" and hash_value in hash_vectors:
+                    field_vectors[field] = hash_vectors[hash_value]
+            
+            if field_vectors:  # Only add if we have at least one vector
+                self.record_embeddings[record_id] = field_vectors
+        
+        logger.info(f"Created embeddings map for {len(self.record_embeddings)} records")
+        
+        # 8. Save the record embeddings for future use
+        self._save_record_embeddings()
+        
+        # 9. Collect records for training
+        all_records = {}
+        for left_id, right_id, _ in ground_truth_pairs:
+            # Get record hashes
+            for record_id in [left_id, right_id]:
+                if record_id not in all_records and record_id in self.data_processor.deduplicator.record_field_hashes:
+                    
+                    field_hashes = self.data_processor.deduplicator.record_field_hashes[record_id]
+                    
+                    # Reconstruct record from field hashes
+                    record = self._reconstruct_record_from_hashes(record_id, field_hashes)
+                    
+                    if record:
+                        all_records[record_id] = record
+        
+        logger.info(f"Collected {len(all_records)} records for training")
+        
+        # 10. Create train/test split
+        from sklearn.model_selection import train_test_split
+        
+        train_pairs, test_pairs = train_test_split(
+            ground_truth_pairs,
+            test_size=0.2,
+            random_state=42,
+            stratify=[int(is_match) for _, _, is_match in ground_truth_pairs]
+        )
+        
+        train_ids = set()
+        for left_id, right_id, _ in train_pairs:
+            train_ids.add(left_id)
+            train_ids.add(right_id)
+            
+        test_ids = set()
+        for left_id, right_id, _ in test_pairs:
+            test_ids.add(left_id)
+            test_ids.add(right_id)
+            
+        train_records = {rid: all_records[rid] for rid in train_ids if rid in all_records}
+        test_records = {rid: all_records[rid] for rid in test_ids if rid in all_records}
+        
+        # 11. Run the actual training
+        self.train_classifier(train_records, test_records, ground_truth_pairs)
+        
+        return True
                 
     def index_strings(self) -> None:
         """
@@ -1339,12 +1550,13 @@ class EntityResolutionPipeline:
     def _prepare_training_data_wrapper(self) -> Tuple[Dict, Dict, List]:
         """
         Wrapper for prepare_training_data that returns the results.
-        Clearly separates training data preparation from model training.
+        Explicitly loads record embeddings from checkpoint if needed.
+        Properly handles train/test split.
         
         Returns:
             Tuple of (train_records, test_records, ground_truth_pairs)
         """
-        logger.info("Preparing training data from ground truth")
+        logger.info("Preparing training data")
         
         # Parse ground truth file to get record IDs
         ground_truth_file = self.config.get("ground_truth_file")
@@ -1354,14 +1566,73 @@ class EntityResolutionPipeline:
             logger.error("No ground truth pairs found. Check your ground truth file format.")
             return {}, {}, []
         
-        # First, retrieve vectors for all records in ground truth
-        self._retrieve_vectors_for_training(ground_truth_pairs)
+        # Explicitly load record embeddings if not already loaded
+        if not hasattr(self, 'record_embeddings') or not self.record_embeddings:
+            logger.info("Loading record embeddings from checkpoint")
+            embeddings_file = os.path.join(self.checkpoint_dir, "record_embeddings.pkl")
+            if os.path.exists(embeddings_file):
+                try:
+                    with open(embeddings_file, 'rb') as f:
+                        self.record_embeddings = pickle.load(f)
+                    logger.info(f"Loaded {len(self.record_embeddings)} record embeddings from checkpoint")
+                except Exception as e:
+                    logger.error(f"Error loading record embeddings: {e}")
         
-        # Then prepare the training data
-        result = self.prepare_training_data()
+        # Collect all unique record IDs from ground truth
+        record_ids = set()
+        for left_id, right_id, _ in ground_truth_pairs:
+            record_ids.add(left_id)
+            record_ids.add(right_id)
         
-        logger.info("Completed training data preparation")
-        return result
+        # Log coverage statistics
+        if hasattr(self, 'record_embeddings') and self.record_embeddings:
+            embedding_ids = set(self.record_embeddings.keys())
+            coverage = len(embedding_ids.intersection(record_ids)) / len(record_ids) if record_ids else 0
+            logger.info(f"Record embeddings coverage: {coverage:.2%} ({len(embedding_ids.intersection(record_ids))}/{len(record_ids)})")
+        else:
+            logger.warning("No record embeddings loaded!")
+        
+        # Collect records for all IDs in ground truth
+        all_records = {}
+        for record_id in record_ids:
+            if record_id in self.data_processor.deduplicator.record_field_hashes:
+                field_hashes = self.data_processor.deduplicator.record_field_hashes[record_id]
+                # Reconstruct record from field hashes
+                record = self._reconstruct_record_from_hashes(record_id, field_hashes)
+                if record:
+                    all_records[record_id] = record
+        
+        logger.info(f"Collected {len(all_records)} records for training")
+        
+        # Create train/test split of the record IDs (not pairs)
+        from sklearn.model_selection import train_test_split
+        
+        # First split the ground truth pairs
+        train_pairs, test_pairs = train_test_split(
+            ground_truth_pairs,
+            test_size=0.2,
+            random_state=42,
+            stratify=[int(is_match) for _, _, is_match in ground_truth_pairs]
+        )
+        
+        # Then extract the record IDs used in each split
+        train_ids = set()
+        for left_id, right_id, _ in train_pairs:
+            train_ids.add(left_id)
+            train_ids.add(right_id)
+            
+        test_ids = set()
+        for left_id, right_id, _ in test_pairs:
+            test_ids.add(left_id)
+            test_ids.add(right_id)
+        
+        # Create train/test record dictionaries
+        train_records = {rid: all_records[rid] for rid in train_ids if rid in all_records}
+        test_records = {rid: all_records[rid] for rid in test_ids if rid in all_records}
+        
+        logger.info(f"Prepared {len(train_pairs)} training pairs, {len(test_pairs)} test pairs")
+        
+        return train_records, test_records, ground_truth_pairs
 
     def check_openai_api_key(self) -> bool:
         """
@@ -1420,7 +1691,7 @@ class EntityResolutionPipeline:
 
     def _retrieve_vectors_for_training(self, ground_truth_pairs: List[Tuple[str, str, bool]]) -> None:
         """
-        Retrieve vectors specifically for the training dataset.
+        Retrieve vectors specifically for the training dataset with enhanced error handling.
         This is a separate step to maintain clear stage separation.
         
         Args:
@@ -1436,25 +1707,60 @@ class EntityResolutionPipeline:
         
         logger.info(f"Found {len(record_ids)} unique records in ground truth data")
         
+        # Check if we already have vectors for these records
+        if hasattr(self, 'record_embeddings') and self.record_embeddings:
+            existing_ids = set(self.record_embeddings.keys())
+            missing_ids = record_ids - existing_ids
+            
+            if not missing_ids:
+                logger.info("All needed vectors already loaded")
+                return
+            
+            logger.info(f"Need to retrieve vectors for {len(missing_ids)} additional records")
+            record_ids = missing_ids
+        
         # Get field hashes for these records
         records_to_process = {}
+        missing_record_count = 0
+        
         for record_id in record_ids:
             if record_id in self.data_processor.deduplicator.record_field_hashes:
                 records_to_process[record_id] = self.data_processor.deduplicator.record_field_hashes[record_id]
             else:
-                logger.warning(f"Record ID {record_id} from ground truth not found in processed data")
+                missing_record_count += 1
+        
+        if missing_record_count > 0:
+            logger.warning(f"{missing_record_count} record IDs from ground truth not found in processed data")
         
         if not records_to_process:
             logger.error("No matching records found between ground truth and processed data")
             return
         
+        # Check if we need to connect to Weaviate first
+        if not self.weaviate_manager.client:
+            logger.info("Connecting to Weaviate for vector retrieval")
+            if not self.weaviate_manager.connect():
+                logger.error("Failed to connect to Weaviate")
+                return
+        
         # Batch retrieve field vectors
-        self.record_embeddings = self.weaviate_manager.get_field_vectors_for_records(records_to_process)
-        
-        # Save retrieved embeddings for later use
-        self._save_record_embeddings()
-        
-        logger.info(f"Retrieved vectors for {len(self.record_embeddings)} training records")
+        try:
+            new_embeddings = self.weaviate_manager.get_field_vectors_for_records(records_to_process)
+            logger.info(f"Retrieved vectors for {len(new_embeddings)} training records")
+            
+            # Merge with existing embeddings if any
+            if hasattr(self, 'record_embeddings') and self.record_embeddings:
+                self.record_embeddings.update(new_embeddings)
+            else:
+                self.record_embeddings = new_embeddings
+            
+            # Save retrieved embeddings for later use
+            self._save_record_embeddings()
+            
+        except Exception as e:
+            logger.error(f"Error retrieving vectors: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def prepare_training_data(self) -> Tuple[Dict[str, Dict], Dict[str, Dict], List[Tuple]]:
         """
@@ -1536,6 +1842,7 @@ class EntityResolutionPipeline:
     def _reconstruct_record_from_hashes(self, record_id: str, field_hashes: Dict[str, str]) -> Optional[Dict]:
         """
         Reconstruct a record from its field hashes by looking up the original strings.
+        Enhanced with better error handling and fallbacks.
         
         Args:
             record_id: ID of the record
@@ -1548,16 +1855,59 @@ class EntityResolutionPipeline:
             record = {"id": record_id}
             unique_strings = self.data_processor.deduplicator.unique_strings
             
-            # Loop through each field and get its original string
-            for field, hash_value in field_hashes.items():
-                if hash_value != "NULL":
-                    if hash_value in unique_strings:
-                        record[field] = unique_strings.get(hash_value, "")
-                    else:
-                        logger.warning(f"Hash value {hash_value} for field {field} in record {record_id} not found in unique strings")
-                        record[field] = ""  # Provide empty string instead of None to avoid errors
+            if not unique_strings:
+                logger.error("No unique strings dictionary available for record reconstruction")
+                # Try to load from checkpoint
+                unique_strings_path = os.path.join(self.checkpoint_dir, "unique_strings.json")
+                if os.path.exists(unique_strings_path):
+                    try:
+                        with open(unique_strings_path, 'r') as f:
+                            unique_strings = json.load(f)
+                        logger.info(f"Loaded {len(unique_strings)} unique strings from checkpoint")
+                        # Update the data processor's dictionary
+                        self.data_processor.deduplicator.unique_strings = unique_strings
+                    except Exception as e:
+                        logger.error(f"Failed to load unique strings from checkpoint: {e}")
+                        return None
                 else:
+                    logger.error("Unique strings checkpoint file not found")
+                    return None
+            
+            # Loop through each field and get its original string
+            missing_hashes = []
+            
+            for field, hash_value in field_hashes.items():
+                if hash_value == "NULL":
                     record[field] = None
+                    continue
+                    
+                if hash_value in unique_strings:
+                    record[field] = unique_strings.get(hash_value, "")
+                else:
+                    missing_hashes.append((field, hash_value))
+                    record[field] = ""  # Provide empty string instead of None to avoid errors
+            
+            if missing_hashes:
+                # Try to fetch missing strings directly from Weaviate as a fallback
+                if hasattr(self, 'weaviate_manager') and self.weaviate_manager.client:
+                    logger.info(f"Attempting to fetch {len(missing_hashes)} missing strings from Weaviate")
+                    for field, hash_value in missing_hashes:
+                        try:
+                            string_collection = self.weaviate_manager.client.collections.get("UniqueStrings")
+                            string_result = string_collection.query.fetch_objects(
+                                filters=string_collection.Filter.by_property("hash").equal(hash_value),
+                                limit=1
+                            )
+                            
+                            if string_result.objects:
+                                text = string_result.objects[0].properties.get("text", "")
+                                record[field] = text
+                                
+                                # Update unique_strings for future use
+                                unique_strings[hash_value] = text
+                                logger.info(f"Successfully retrieved missing string for hash {hash_value}")
+                        except Exception as e:
+                            logger.warning(f"Failed to retrieve string for hash {hash_value}: {e}")
             
             # Validate that we have the minimum required fields
             required_fields = ['person', 'roles', 'title']

@@ -286,7 +286,7 @@ class FeatureEngineer:
     
     def compute_vector_similarities(self, fields1: Dict[str, List[float]], fields2: Dict[str, List[float]]) -> Dict[str, float]:
         """
-        Compute vector similarities between corresponding fields.
+        Compute vector similarities between corresponding fields with support for both list and dict formats.
         
         Args:
             fields1: Dictionary of field vectors for first record
@@ -302,18 +302,49 @@ class FeatureEngineer:
             vec1 = fields1.get(field, [])
             vec2 = fields2.get(field, [])
             
-            if vec1 and vec2:
+            # Skip fields with missing vectors
+            if not vec1 or not vec2:
+                similarities[f"{field}_cosine"] = 0.0
+                continue
+            
+            # Handle different vector formats (dict or list)
+            # The diagnostic showed vectors are stored as dicts of length 1
+            if isinstance(vec1, dict) and 'default' in vec1:
+                vec1 = vec1.get('default', [])
+            elif isinstance(vec1, dict) and len(vec1) == 1:
+                # If it's a dict with one key (but not 'default'), take the first value
+                vec1 = next(iter(vec1.values()), [])
+                
+            if isinstance(vec2, dict) and 'default' in vec2:
+                vec2 = vec2.get('default', [])
+            elif isinstance(vec2, dict) and len(vec2) == 1:
+                vec2 = next(iter(vec2.values()), [])
+            
+            # Skip if either vector is empty after conversion
+            if not vec1 or not vec2:
+                similarities[f"{field}_cosine"] = 0.0
+                continue
+            
+            # Ensure vectors have same dimensionality
+            if len(vec1) != len(vec2):
+                similarities[f"{field}_cosine"] = 0.0
+                continue
+            
+            # Compute cosine similarity
+            try:
                 similarity = self.compute_cosine_similarity(vec1, vec2)
                 similarities[f"{field}_cosine"] = similarity
-            else:
+            except Exception as e:
+                logger.debug(f"Error computing cosine similarity for field {field}: {str(e)}")
                 similarities[f"{field}_cosine"] = 0.0
         
         return similarities
+
     
     def generate_features(self, record1: Dict, record2: Dict, 
-                         embeddings1: Dict[str, List[float]], embeddings2: Dict[str, List[float]]) -> Dict[str, float]:
+                     embeddings1: Dict[str, List[float]], embeddings2: Dict[str, List[float]]) -> Dict[str, float]:
         """
-        Generate features for a pair of records.
+        Generate features for a pair of records with improved error handling and logging.
         
         Args:
             record1: First record dictionary
@@ -326,33 +357,60 @@ class FeatureEngineer:
         """
         features = {}
         
-        # Name-based features
-        name_features = self.compute_name_similarity(record1.get("person", ""), record2.get("person", ""))
-        features.update(name_features)
+        # Debug checks to help diagnose issues
+        record1_id = record1.get("id", "unknown")
+        record2_id = record2.get("id", "unknown")
         
-        # Temporal features from provision
-        temporal_features = self.compute_temporal_features(
-            record1.get("provision", ""), 
-            record2.get("provision", "")
-        )
-        features.update(temporal_features)
-        
-        # Vector-based similarity features
-        vector_features = self.compute_vector_similarities(embeddings1, embeddings2)
-        features.update(vector_features)
-        
-        # Text length features
-        for field in ["person", "roles", "title", "record"]:
-            len1 = len(record1.get(field, "")) if record1.get(field) else 0
-            len2 = len(record2.get(field, "")) if record2.get(field) else 0
+        # Check if both records have person names
+        if not record1.get("person") or not record2.get("person"):
+            # Skip pairs where person name is missing
+            logger.debug(f"Missing person in one of the records: {record1_id} or {record2_id}")
+            return features
+
+        try:
+            # Name-based features
+            name_features = self.compute_name_similarity(
+                record1.get("person", ""), 
+                record2.get("person", "")
+            )
+            features.update(name_features)
             
-            features[f"{field}_len_ratio"] = min(len1, len2) / max(len1, len2) if max(len1, len2) > 0 else 0.0
+            # Temporal features from provision
+            temporal_features = self.compute_temporal_features(
+                record1.get("provision", ""), 
+                record2.get("provision", "")
+            )
+            features.update(temporal_features)
+            
+            # Vector-based similarity features - only if embeddings are available
+            if embeddings1 and embeddings2:
+                vector_features = self.compute_vector_similarities(embeddings1, embeddings2)
+                features.update(vector_features)
+            else:
+                # Add placeholder features if vectors aren't available
+                for field in self.field_weights.keys():
+                    features[f"{field}_cosine"] = 0.0
+            
+            # Text length features
+            for field in ["person", "roles", "title", "record"]:
+                len1 = len(record1.get(field, "")) if record1.get(field) else 0
+                len2 = len(record2.get(field, "")) if record2.get(field) else 0
+                
+                features[f"{field}_len_ratio"] = min(len1, len2) / max(len1, len2) if max(len1, len2) > 0 else 0.0
+            
+            # Field presence indicators
+            for field in ["attribution", "provision", "subjects", "genres", "relatedWork"]:
+                features[f"{field}_present_both"] = 1.0 if (record1.get(field) and record2.get(field)) else 0.0
+                features[f"{field}_present_none"] = 1.0 if (not record1.get(field) and not record2.get(field)) else 0.0
+                features[f"{field}_present_one"] = 1.0 if (bool(record1.get(field)) != bool(record2.get(field))) else 0.0
+            
+            # Check if we have enough features
+            if len(features) < 5:  # Arbitrary minimum threshold
+                logger.warning(f"Too few features generated for records {record1_id} and {record2_id}: {len(features)}")
         
-        # Field presence indicators
-        for field in ["attribution", "provision", "subjects", "genres", "relatedWork"]:
-            features[f"{field}_present_both"] = 1.0 if (record1.get(field) and record2.get(field)) else 0.0
-            features[f"{field}_present_none"] = 1.0 if (not record1.get(field) and not record2.get(field)) else 0.0
-            features[f"{field}_present_one"] = 1.0 if (bool(record1.get(field)) != bool(record2.get(field))) else 0.0
+        except Exception as e:
+            logger.warning(f"Error generating features for records {record1_id} and {record2_id}: {str(e)}")
+            # Return empty features dict which will be skipped
         
         return features
     
@@ -376,7 +434,7 @@ class FeatureEngineer:
     
     def prepare_training_data(self, train_pairs: List[Tuple], record_embeddings: Dict[str, Dict[str, List[float]]]) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """
-        Prepare training data for the classifier.
+        Prepare training data for the classifier with improved embeddings access.
         
         Args:
             train_pairs: List of (record1, record2, is_match) tuples
@@ -394,34 +452,90 @@ class FeatureEngineer:
         # Generate features for each pair
         feature_dicts = []
         labels = []
+        error_count = 0
+        missing_embeddings = 0
+        missing_ids = set()
         
         for record1, record2, is_match in tqdm(train_pairs, desc="Generating features"):
             record1_id = record1.get("id")
             record2_id = record2.get("id")
             
             if not record1_id or not record2_id:
+                error_count += 1
                 continue
                 
-            # Get embeddings for the records
+            # Get embeddings for the records - add detailed logging
             embeddings1 = record_embeddings.get(record1_id, {})
             embeddings2 = record_embeddings.get(record2_id, {})
             
+            if not embeddings1:
+                missing_ids.add(record1_id)
+            if not embeddings2:
+                missing_ids.add(record2_id)
+                
             if not embeddings1 or not embeddings2:
-                # Skip pairs without embeddings
+                # Skip pairs without embeddings but count them
+                missing_embeddings += 1
+                if missing_embeddings <= 5:  # Only log the first few to avoid flood
+                    logger.debug(f"Missing embeddings for records: {record1_id if not embeddings1 else ''}, {record2_id if not embeddings2 else ''}")
                 continue
                 
             # Generate features
             features = self.generate_features(record1, record2, embeddings1, embeddings2)
-            feature_dicts.append(features)
-            labels.append(1 if is_match else 0)
+            
+            # Only add if features were actually generated
+            if features:
+                feature_dicts.append(features)
+                labels.append(1 if is_match else 0)
+        
+        # Log diagnostics
+        if missing_embeddings > 0:
+            logger.warning(f"Skipped {missing_embeddings} pairs due to missing embeddings")
+            # Log some of the missing IDs
+            if missing_ids:
+                sample_missing = list(missing_ids)[:10]
+                logger.warning(f"Sample missing embedding IDs: {sample_missing}")
+        
+        if error_count > 0:
+            logger.warning(f"Skipped {error_count} pairs due to missing record IDs")
         
         if not feature_dicts:
             logger.error("No valid feature dictionaries generated")
+            # Provide more diagnostics
+            if train_pairs:
+                sample_pair = train_pairs[0]
+                sample_record1 = sample_pair[0]
+                sample_record2 = sample_pair[1]
+                sample_id1 = sample_record1.get("id", "unknown")
+                sample_id2 = sample_record2.get("id", "unknown")
+                
+                # Check embeddings
+                has_embedding1 = sample_id1 in record_embeddings
+                has_embedding2 = sample_id2 in record_embeddings
+                
+                logger.error(f"Sample pair diagnostic - Record IDs: {sample_id1}, {sample_id2}")
+                logger.error(f"Embeddings available: {has_embedding1}, {has_embedding2}")
+                
+                if has_embedding1:
+                    emb1 = record_embeddings.get(sample_id1, {})
+                    logger.error(f"Sample embedding keys for {sample_id1}: {list(emb1.keys())}")
+                    
+                    # Check field value for a specific field
+                    if 'person' in emb1:
+                        person_vec = emb1['person']
+                        logger.error(f"Person vector type: {type(person_vec)}, {'length=1 dict' if isinstance(person_vec, dict) and len(person_vec)==1 else 'not length=1 dict'}")
+                        if isinstance(person_vec, dict) and len(person_vec) == 1:
+                            first_key = next(iter(person_vec.keys()))
+                            logger.error(f"Person vector dict first key: {first_key}")
+                    
             return np.array([]), np.array([]), []
         
-        # Vectorize features
-        first_dict = feature_dicts[0]
-        feature_names = sorted(first_dict.keys())
+        # Collect all feature names from all dictionaries
+        all_feature_names = set()
+        for feat_dict in feature_dicts:
+            all_feature_names.update(feat_dict.keys())
+        
+        feature_names = sorted(all_feature_names)
         
         # Create feature matrix
         X = np.zeros((len(feature_dicts), len(feature_names)))

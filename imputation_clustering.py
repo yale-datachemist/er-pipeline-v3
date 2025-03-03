@@ -152,7 +152,8 @@ class EntityClusterer:
     
     def get_query_candidates(self, person_vector: List[float], person_name: str, record_id: str) -> List[Dict]:
         """
-        Get candidate matches for a query record using ANN search.
+        Get candidate matches for a query record using improved blocking approach.
+        This version implements better name-based blocking before comparing vectors.
         
         Args:
             person_vector: Vector embedding of the person name
@@ -162,43 +163,258 @@ class EntityClusterer:
         Returns:
             List of candidate records
         """
-        # First, do vector search for candidates
-        neighbors = self.weaviate_manager.search_neighbors(
-            query_vector=person_vector,
-            limit=self.max_neighbors,
-            distance_threshold=0.3  # Can be adjusted based on validation
-        )
+        candidates = []
         
-        # Filter out the query record itself
-        candidates = [n for n in neighbors if n.get("id") != record_id]
-        
-        # Additional filtering for name components
-        filtered_candidates = []
-        query_name_parts = self.feature_engineer.extract_name_components(person_name)
-        
-        for candidate in candidates:
-            candidate_name = candidate.get("person", "")
-            candidate_parts = self.feature_engineer.extract_name_components(candidate_name)
+        try:
+            # Extract name components for blocking
+            query_name_parts = self.feature_engineer.extract_name_components(person_name)
+            query_last_name = query_name_parts.get("last_name", "").lower()
+            query_first_initial = query_name_parts.get("first_name", "")[0:1].lower() if query_name_parts.get("first_name") else ""
             
-            # Strong signal: exact match with life dates
-            if (query_name_parts["birth_year"] and query_name_parts["birth_year"] == candidate_parts["birth_year"]):
-                filtered_candidates.append(candidate)
-                continue
+            # Skip if we don't have a last name for blocking
+            if not query_last_name:
+                logger.debug(f"Skipping record {record_id}: No last name available for blocking")
+                return []
+            
+            # Check if we have access to data_processor through WeaviateManager
+            # If not, try to use a direct reference to data_processor
+            if not hasattr(self.weaviate_manager, 'data_processor'):
+                logger.warning("WeaviateManager doesn't have data_processor attribute. Using alternative approach.")
                 
-            # Last name match
-            if (query_name_parts["last_name"] and candidate_parts["last_name"] and 
-                query_name_parts["last_name"].lower() == candidate_parts["last_name"].lower()):
+                # Use record_embeddings directly for candidate selection
+                # This is a fallback approach
+                record_embeddings = getattr(self.weaviate_manager, 'record_embeddings', {})
+                if not record_embeddings:
+                    logger.error("No record embeddings available in WeaviateManager")
+                    return []
                 
-                # First initial match
-                if (query_name_parts["first_name"] and candidate_parts["first_name"] and
-                    query_name_parts["first_name"][0].lower() == candidate_parts["first_name"][0].lower()):
-                    filtered_candidates.append(candidate)
+                # Dictionary to track already seen strings to avoid duplicates
+                seen_candidates = set()
+                
+                # Ensure person_vector is a flat list
+                if isinstance(person_vector, dict):
+                    if 'default' in person_vector:
+                        person_vector = person_vector['default']
+                    else:
+                        person_vector = next(iter(person_vector.values()))
+                
+                # Ensure it's a list
+                if hasattr(person_vector, 'tolist'):
+                    person_vector = person_vector.tolist()
+                    
+                # Direct vector comparison to find candidates
+                for candidate_id, candidate_embeddings in record_embeddings.items():
+                    # Skip self-comparison
+                    if candidate_id == record_id:
+                        continue
+                    
+                    # Get candidate person vector
+                    candidate_person_vector = candidate_embeddings.get('person', None)
+                    if not candidate_person_vector:
+                        continue
+                    
+                    # Ensure it's a flat list
+                    if isinstance(candidate_person_vector, dict):
+                        if 'default' in candidate_person_vector:
+                            candidate_person_vector = candidate_person_vector['default']
+                        else:
+                            candidate_person_vector = next(iter(candidate_person_vector.values()))
+                    
+                    # Compute similarity
+                    similarity = self.feature_engineer.compute_cosine_similarity(
+                        person_vector, candidate_person_vector
+                    )
+                    
+                    # If similar enough, add to candidates
+                    if similarity > 0.8:  # Higher threshold for this method
+                        candidates.append({
+                            "id": candidate_id,
+                            "person": "Unknown",  # We don't have access to the actual name
+                            "hash": "",  # No hash available
+                            "distance": 1.0 - similarity,
+                            "vector": candidate_person_vector
+                        })
+                        
+                        # Limit to a reasonable number
+                        if len(candidates) >= 50:
+                            break
+                            
+                return candidates[:self.max_neighbors]
+                
+            # If we have data_processor, use the proper approach
+            # Dictionary to track already seen strings to avoid duplicates
+            seen_candidates = set()
+            
+            # First pass: Find candidates with matching last name and optionally first initial
+            matching_candidates = []
+            for candidate_id, field_hashes in self.weaviate_manager.data_processor.deduplicator.record_field_hashes.items():
+                # Skip self-comparison
+                if candidate_id == record_id:
                     continue
+                
+                # Get person hash
+                person_hash = field_hashes.get('person', '')
+                if person_hash and person_hash != 'NULL':
+                    # Get the actual person name
+                    unique_strings = self.weaviate_manager.data_processor.deduplicator.unique_strings
+                    candidate_name = unique_strings.get(person_hash, '')
+                    
+                    # Skip if we've seen this exact name before
+                    if candidate_name in seen_candidates:
+                        continue
+                    seen_candidates.add(candidate_name)
+                    
+                    # Extract name components
+                    candidate_parts = self.feature_engineer.extract_name_components(candidate_name)
+                    candidate_last_name = candidate_parts.get("last_name", "").lower()
+                    candidate_first_initial = candidate_parts.get("first_name", "")[0:1].lower() if candidate_parts.get("first_name") else ""
+                    
+                    # Check if last names match or are very similar
+                    last_name_match = False
+                    
+                    # Exact match
+                    if candidate_last_name == query_last_name:
+                        last_name_match = True
+                    # Or check for Levenshtein distance for near matches
+                    elif candidate_last_name and query_last_name:
+                        import Levenshtein
+                        distance = Levenshtein.distance(candidate_last_name, query_last_name)
+                        max_len = max(len(candidate_last_name), len(query_last_name))
+                        if max_len > 0 and distance / max_len < 0.2:  # Allow 20% error rate
+                            last_name_match = True
+                    
+                    # Skip if last names don't match at all
+                    if not last_name_match:
+                        continue
+                    
+                    # Check for first initial match if both have first names
+                    # If both have first initials, they should match; otherwise, it's okay if one is missing
+                    if query_first_initial and candidate_first_initial and query_first_initial != candidate_first_initial:
+                        # Skip if first initials don't match when both are present
+                        continue
+                    
+                    # Check life dates for obvious mismatches
+                    query_birth = query_name_parts.get("birth_year")
+                    query_death = query_name_parts.get("death_year")
+                    candidate_birth = candidate_parts.get("birth_year")
+                    candidate_death = candidate_parts.get("death_year")
+                    
+                    # If both have birth years and they differ by more than 10 years, skip
+                    if query_birth and candidate_birth:
+                        try:
+                            birth1 = int(query_birth)
+                            birth2 = int(candidate_birth)
+                            if abs(birth1 - birth2) > 10:
+                                # Skip pairs with very different birth years
+                                continue
+                        except ValueError:
+                            # Non-numeric years, ignore
+                            pass
+                    
+                    # Add as a matching candidate
+                    matching_candidates.append({
+                        "id": candidate_id,
+                        "person": candidate_name,
+                        "hash": person_hash,
+                        "name_parts": candidate_parts,
+                        "field_hashes": field_hashes
+                    })
             
-            # Include near matches
-            filtered_candidates.append(candidate)
+            logger.debug(f"Found {len(matching_candidates)} initial candidates by name matching")
+            
+            # Second pass: For each candidate, check embedding similarity
+            # Ensure person_vector is a flat list
+            if isinstance(person_vector, dict):
+                if 'default' in person_vector:
+                    person_vector = person_vector['default']
+                else:
+                    person_vector = next(iter(person_vector.values()))
+            
+            # Ensure it's a list
+            if hasattr(person_vector, 'tolist'):
+                person_vector = person_vector.tolist()
+            
+            # Get record_embeddings - try both places
+            record_embeddings = getattr(self.weaviate_manager, 'record_embeddings', {})
+            if not record_embeddings and hasattr(self, 'record_embeddings'):
+                record_embeddings = self.record_embeddings
+            
+            # Check vector similarity for each candidate
+            for candidate in matching_candidates:
+                candidate_id = candidate["id"]
+                
+                # Get candidate's person embedding from record_embeddings
+                if candidate_id in record_embeddings:
+                    candidate_embeddings = record_embeddings[candidate_id]
+                    candidate_person_vector = candidate_embeddings.get('person', None)
+                    
+                    if candidate_person_vector:
+                        # Ensure it's a flat list
+                        if isinstance(candidate_person_vector, dict):
+                            if 'default' in candidate_person_vector:
+                                candidate_person_vector = candidate_person_vector['default']
+                            else:
+                                candidate_person_vector = next(iter(candidate_person_vector.values()))
+                        
+                        # Compute cosine similarity
+                        similarity = self.feature_engineer.compute_cosine_similarity(
+                            person_vector, candidate_person_vector
+                        )
+                        
+                        # If similarity is high enough, add to final candidates
+                        if similarity > 0.6:  # Adjust threshold as needed
+                            final_candidate = {
+                                "id": candidate_id,
+                                "person": candidate["person"],
+                                "hash": candidate["hash"],
+                                "distance": 1.0 - similarity,
+                                "vector": candidate_person_vector
+                            }
+                            candidates.append(final_candidate)
+                    else:
+                        # If no person vector, use a higher threshold for name matching
+                        # Check for more specific name matching as fallback
+                        query_parts = query_name_parts
+                        candidate_parts = candidate["name_parts"]
+                        
+                        # If BOTH have life dates and they match, add as candidate
+                        if (query_parts.get("birth_year") and candidate_parts.get("birth_year") and 
+                            query_parts["birth_year"] == candidate_parts["birth_year"]):
+                            
+                            # Even stronger match if death years also match
+                            if (query_parts.get("death_year") and candidate_parts.get("death_year") and 
+                                query_parts["death_year"] == candidate_parts["death_year"]):
+                                
+                                final_candidate = {
+                                    "id": candidate_id,
+                                    "person": candidate["person"],
+                                    "hash": candidate["hash"],
+                                    "distance": 0.2,  # Very low distance for matching life dates
+                                    "vector": []  # Empty vector
+                                }
+                                candidates.append(final_candidate)
+                else:
+                    # If no embeddings at all, only add as candidate if name is very similar
+                    if candidate["person"].lower() == person_name.lower():
+                        final_candidate = {
+                            "id": candidate_id,
+                            "person": candidate["person"],
+                            "hash": candidate["hash"],
+                            "distance": 0.3,  # Low distance for exact name match
+                            "vector": []  # Empty vector
+                        }
+                        candidates.append(final_candidate)
+            
+            logger.debug(f"Final candidate count after filtering: {len(candidates)}")
+            
+            # Limit to max_neighbors
+            return candidates[:self.max_neighbors]
         
-        return filtered_candidates[:self.max_neighbors]  # Limit to max neighbors
+        except Exception as e:
+            logger.error(f"Error getting query candidates: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
     
     def classify_record_pair(self, record1: Dict, record2: Dict, 
                              embeddings1: Dict[str, List[float]], embeddings2: Dict[str, List[float]]) -> Tuple[bool, float]:

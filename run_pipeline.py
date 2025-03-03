@@ -335,7 +335,7 @@ def main():
         elif args.stage == 'index':
             # Run setup and indexing
             pipeline_instance.setup_weaviate()
-            pipeline_instance.index_strings()
+            pipeline_instance.run_pipeline_training_stage()
             
         elif args.stage == 'train':
             # Run classifier training

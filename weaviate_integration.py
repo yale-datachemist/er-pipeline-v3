@@ -493,7 +493,7 @@ class WeaviateManager:
             
             # Query by entity_id for exact match
             result = collection.query.fetch_objects(
-                filters=collection.query.filter.by_property("entity_id").equal(entity_id),
+                filters=collection.Filter.by_property("entity_id").equal(entity_id),
                 limit=1
             )
             
@@ -531,7 +531,7 @@ class WeaviateManager:
             
             # Query by hash for exact match
             result = collection.query.fetch_objects(
-                filters=collection.query.filter.by_property("hash").equal(hash_value),
+                filters=collection.Filter.by_property("hash").equal(hash_value),
                 limit=1,
                 include_vector=True
             )
@@ -547,7 +547,7 @@ class WeaviateManager:
     
     def get_vectors_by_hashes(self, hash_values: List[str]) -> Dict[str, List[float]]:
         """
-        Retrieve multiple vectors by their string hashes in batch.
+        Retrieve multiple vectors by their string hashes in batch with better error handling.
         
         Args:
             hash_values: List of string hashes
@@ -562,16 +562,29 @@ class WeaviateManager:
         result_vectors = {}
         unique_hashes = list(set(hash_values))  # Remove duplicates
         
+        if not unique_hashes:
+            return {}
+        
+        # Log sample hashes for debugging
+        logger.info(f"Retrieving vectors for {len(unique_hashes)} unique hashes")
+        if len(unique_hashes) > 3:
+            logger.info(f"Sample hashes: {unique_hashes[:3]}")
+        
         # Process in reasonable batch sizes
-        batch_size = 100
+        batch_size = 50  # Smaller batch size for reliability
         for i in range(0, len(unique_hashes), batch_size):
             batch_hashes = unique_hashes[i:i+batch_size]
             
             try:
                 collection = self.client.collections.get("UniqueStrings")
                 
-                # Build filter for batch of hashes
-                hash_filter = Filter.by_property("hash").contains_any(batch_hashes)
+                # Build filter for batch of hashes - use Weaviate's contains_any operator
+                if len(batch_hashes) == 1:
+                    # For a single hash, use equals
+                    hash_filter = collection.Filter.by_property("hash").equal(batch_hashes[0])
+                else:
+                    # For multiple hashes, use contains_any
+                    hash_filter = collection.Filter.by_property("hash").contains_any(batch_hashes)
                 
                 # Execute query
                 result = collection.query.fetch_objects(
@@ -580,20 +593,37 @@ class WeaviateManager:
                     include_vector=True
                 )
                 
+                if not result.objects:
+                    logger.warning(f"No objects found for batch of {len(batch_hashes)} hashes")
+                    continue
+                
                 # Extract vectors
                 for obj in result.objects:
                     hash_value = obj.properties.get("hash")
                     if hash_value and obj.vector:
-                        result_vectors[hash_value] = obj.vector
+                        if isinstance(obj.vector, list) and len(obj.vector) > 0:
+                            result_vectors[hash_value] = obj.vector
+                        else:
+                            logger.warning(f"Invalid vector for hash {hash_value}")
+                
+                logger.info(f"Processed batch {i//batch_size + 1}/{(len(unique_hashes)-1)//batch_size + 1}: " 
+                        f"Retrieved {len(result.objects)} objects")
                 
             except Exception as e:
                 logger.error(f"Error batch retrieving vectors: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
         
         # Report on missing hashes
         missing_hashes = set(hash_values) - set(result_vectors.keys())
         if missing_hashes:
             logger.warning(f"Could not retrieve vectors for {len(missing_hashes)} hashes")
+            if len(missing_hashes) <= 5:
+                logger.warning(f"Missing hashes: {list(missing_hashes)}")
         
+        if not result_vectors:
+            logger.error("Failed to retrieve any vectors")
+            
         return result_vectors
     
     def get_field_vectors_for_records(self, records_field_hashes: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, List[float]]]:
@@ -681,22 +711,27 @@ class WeaviateManager:
                 logger.error(f"Vector has incorrect dimensionality: {len(query_vector)}, expected {expected_dim}")
                 return []
             
-            # Build query - using near_vector as per Weaviate documentation
-            query = collection.query.near_vector(
-                near_vector=query_vector,  # Use 'near_vector' as per documentation
-                limit=limit,
-                return_metadata=MetadataQuery(distance=True),
-                include_vector=True
-            )
+            # Import Filter class
+            from weaviate.classes.query import Filter, MetadataQuery
             
-            # Add field type filter if specified
+            # Build query
             if field_type:
-                query = query.with_filter(
-                    collection.query.filter.by_property("field_type").equal(field_type)
+                # Apply field type filter - using the correct syntax
+                result = collection.query.near_vector(
+                    near_vector=query_vector,
+                    limit=limit,
+                    return_metadata=MetadataQuery(distance=True),
+                    include_vector=True,
+                    filters=Filter.by_property("field_type").equal(field_type)
                 )
-            
-            # Execute query
-            result = query.fetch_objects()
+            else:
+                # No filter needed
+                result = collection.query.near_vector(
+                    near_vector=query_vector,
+                    limit=limit,
+                    return_metadata=MetadataQuery(distance=True),
+                    include_vector=True
+                )
             
             # Process results
             similar_strings = []
@@ -717,6 +752,7 @@ class WeaviateManager:
             import traceback
             logger.error(traceback.format_exc())
             return []
+
 
     # Also add a missing search_neighbors method with the correct parameter name
     def search_neighbors(
@@ -755,20 +791,17 @@ class WeaviateManager:
             if hasattr(query_vector, 'tolist'):
                 query_vector = query_vector.tolist()
             
-            # Build query with correct parameter name
-            query = collection.query.near_vector(
-                near_vector=query_vector,  # Using near_vector as per documentation 
+            # Import Filter class
+            from weaviate.classes.query import Filter, MetadataQuery
+            
+            # Build query with correct filter syntax
+            result = collection.query.near_vector(
+                near_vector=query_vector,
                 limit=limit,
                 return_metadata=MetadataQuery(distance=True),
-                include_vector=True
+                include_vector=True,
+                filters=Filter.by_property("field_type").equal("person")
             )
-            
-            # Execute query focusing on person records
-            query = query.with_filter(
-                collection.query.filter.by_property("field_type").equal("person")
-            )
-            
-            result = query.fetch_objects()
             
             # Process results
             neighbors = []
@@ -779,39 +812,61 @@ class WeaviateManager:
                     continue
                 
                 # Find entities using this person hash
-                entity_collection = self.client.collections.get("EntityMap")
-                filter_str = f'{{field_hashes_json: {{path: ["person"], equals: "{hash_value}"}}}}'
-                
-                entity_results = entity_collection.query.raw(
-                    f"""
-                    {{
-                        Get {{
-                            EntityMap(
-                                where: {filter_str}
-                                limit: 5
-                            ) {{
-                                entity_id
-                                person_name
-                                field_hashes_json
-                            }}
-                        }}
-                    }}
-                    """
-                )
-                
-                # Process entity results
-                entities = entity_results.get("data", {}).get("Get", {}).get("EntityMap", [])
-                for entity in entities:
-                    entity_id = entity.get("entity_id")
+                # We need to use the GraphQL endpoint instead of raw queries
+                try:
+                    # Directly query EntityMap collection with a filter
+                    entity_collection = self.client.collections.get("EntityMap")
                     
-                    # Use entity ID to fetch full record if needed
-                    neighbors.append({
-                        "id": entity_id,
-                        "person": obj.properties.get("text", ""),
-                        "hash": hash_value,
-                        "distance": obj.metadata.distance,
-                        "vector": obj.vector
-                    })
+                    # Check if field_hashes_json contains the person hash
+                    # Since this depends on the actual structure, we'll try a simpler approach
+                    entity_results = entity_collection.query.fetch_objects(
+                        limit=5,
+                        include_vector=False
+                    ).objects
+                    
+                    # Filter results manually (not ideal but works for limited data)
+                    matching_entities = []
+                    for entity in entity_results:
+                        field_hashes_json = entity.properties.get("field_hashes_json", "{}")
+                        # See if we can find the hash in the JSON string
+                        if hash_value in field_hashes_json:
+                            matching_entities.append(entity)
+                        
+                        # Limit to 5 matches
+                        if len(matching_entities) >= 5:
+                            break
+                    
+                    # Process matching entities
+                    for entity in matching_entities:
+                        entity_id = entity.properties.get("entity_id")
+                        if entity_id:
+                            neighbors.append({
+                                "id": entity_id,
+                                "person": obj.properties.get("text", ""),
+                                "hash": hash_value,
+                                "distance": obj.metadata.distance,
+                                "vector": obj.vector
+                            })
+                except Exception as inner_e:
+                    logger.warning(f"Error finding entities for hash {hash_value}: {inner_e}")
+                    # Even if this fails, we can return the current object
+                    # Try to extract an entity ID from the hash
+                    try:
+                        import re
+                        # Look for patterns like 123456#Agent100-11 in the text
+                        text = obj.properties.get("text", "")
+                        entity_match = re.search(r'(\d+#[A-Za-z0-9-]+)', text)
+                        if entity_match:
+                            entity_id = entity_match.group(1)
+                            neighbors.append({
+                                "id": entity_id,
+                                "person": text,
+                                "hash": hash_value,
+                                "distance": obj.metadata.distance,
+                                "vector": obj.vector
+                            })
+                    except Exception:
+                        pass
             
             return neighbors
             
