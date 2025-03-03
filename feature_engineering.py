@@ -438,7 +438,7 @@ class FeatureEngineer:
                 features[f"{field}_len_ratio"] = min(len1, len2) / max(len1, len2) if max(len1, len2) > 0 else 0.0
             
             # Field presence indicators
-            for field in "provision", "subjects", "genres"]:
+            for field in ["provision", "subjects", "genres"]:
                 features[f"{field}_present_both"] = 1.0 if (record1.get(field) and record2.get(field)) else 0.0
                 features[f"{field}_present_none"] = 1.0 if (not record1.get(field) and not record2.get(field)) else 0.0
                 features[f"{field}_present_one"] = 1.0 if (bool(record1.get(field)) != bool(record2.get(field))) else 0.0
