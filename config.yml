@@ -76,7 +76,7 @@ max_neighbors: 500
 graph_batch_size: 1000  # Records per batch for graph building
 
 # LLM fallback settings
-use_llm_fallback: true
+use_llm_fallback: false
 llm_model: "gpt-4o"
 max_llm_requests: 1000  # Limit number of LLM API calls
 

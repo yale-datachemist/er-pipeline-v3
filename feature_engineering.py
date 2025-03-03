@@ -286,7 +286,7 @@ class FeatureEngineer:
     
     def compute_vector_similarities(self, fields1: Dict[str, List[float]], fields2: Dict[str, List[float]]) -> Dict[str, float]:
         """
-        Compute vector similarities between corresponding fields with support for both list and dict formats.
+        Compute vector similarities between corresponding fields with better vector format handling.
         
         Args:
             fields1: Dictionary of field vectors for first record
@@ -307,26 +307,18 @@ class FeatureEngineer:
                 similarities[f"{field}_cosine"] = 0.0
                 continue
             
-            # Handle different vector formats (dict or list)
-            # The diagnostic showed vectors are stored as dicts of length 1
-            if isinstance(vec1, dict) and 'default' in vec1:
-                vec1 = vec1.get('default', [])
-            elif isinstance(vec1, dict) and len(vec1) == 1:
-                # If it's a dict with one key (but not 'default'), take the first value
-                vec1 = next(iter(vec1.values()), [])
-                
-            if isinstance(vec2, dict) and 'default' in vec2:
-                vec2 = vec2.get('default', [])
-            elif isinstance(vec2, dict) and len(vec2) == 1:
-                vec2 = next(iter(vec2.values()), [])
+            # Normalize vector formats
+            vec1 = self._normalize_vector(vec1, field, "record1")
+            vec2 = self._normalize_vector(vec2, field, "record2")
             
-            # Skip if either vector is empty after conversion
+            # Skip if either vector is still empty after normalization
             if not vec1 or not vec2:
                 similarities[f"{field}_cosine"] = 0.0
                 continue
             
             # Ensure vectors have same dimensionality
             if len(vec1) != len(vec2):
+                logger.warning(f"Vector dimension mismatch for {field}: {len(vec1)} vs {len(vec2)}")
                 similarities[f"{field}_cosine"] = 0.0
                 continue
             
@@ -339,6 +331,54 @@ class FeatureEngineer:
                 similarities[f"{field}_cosine"] = 0.0
         
         return similarities
+
+    def _normalize_vector(self, vector, field_name="unknown", record_id="unknown"):
+        """
+        Normalize vector to a flat list format.
+        
+        Args:
+            vector: The vector to normalize
+            field_name: Field name for logging
+            record_id: Record ID for logging
+            
+        Returns:
+            Normalized vector as a flat list
+        """
+        try:
+            # Already a list
+            if isinstance(vector, list) and len(vector) > 0:
+                return vector
+                
+            # Dictionary format
+            if isinstance(vector, dict):
+                # Look for common patterns
+                if 'values' in vector:
+                    return vector['values']
+                elif 'default' in vector:
+                    return vector['default']
+                elif len(vector) == 1:
+                    # Single key dictionary
+                    return next(iter(vector.values()))
+                elif len(vector) > 0:
+                    # Log all keys for debugging
+                    logger.debug(f"Vector dictionary has multiple keys: {list(vector.keys())}")
+                    # Just take the first value
+                    return next(iter(vector.values()))
+                else:
+                    logger.warning(f"Empty vector dictionary for field {field_name}, record {record_id}")
+                    return []
+                    
+            # Handle numpy arrays and other iterables
+            elif hasattr(vector, 'tolist'):
+                return vector.tolist()
+            elif hasattr(vector, '__iter__'):
+                return list(vector)
+            else:
+                logger.warning(f"Unrecognized vector type {type(vector)} for field {field_name}, record {record_id}")
+                return []
+        except Exception as e:
+            logger.warning(f"Error normalizing vector: {str(e)}")
+            return []
 
     
     def generate_features(self, record1: Dict, record2: Dict, 

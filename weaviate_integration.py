@@ -2,6 +2,7 @@ import atexit
 import logging
 import time
 import json
+import os
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Set, Any, Iterable
 import weaviate
@@ -145,28 +146,45 @@ class WeaviateManager:
         """
         Close the Weaviate connection and perform cleanup.
         """
+        from weaviate_fix import run_async, is_coroutine
+        
         if self.client:
             try:
                 # Close any active batch operations
                 collections = getattr(self.client, 'collections', None)
                 if collections:
-                    collection_list = collections.list_all()
-                    for collection in collection_list:
-                        if hasattr(collection, 'batch') and collection.batch:
-                            try:
-                                collection.batch.close()
-                                logger.info(f"Closed batch for collection: {collection.name}")
-                            except Exception as e:
-                                logger.warning(f"Error closing batch for {collection.name}: {str(e)}")
+                    try:
+                        collection_list = collections.list_all()
+                        for collection in collection_list:
+                            if hasattr(collection, 'batch') and collection.batch:
+                                try:
+                                    close_method = collection.batch.close
+                                    if is_coroutine(close_method):
+                                        run_async(close_method)
+                                    else:
+                                        close_method()
+                                    logger.info(f"Closed batch for collection: {collection.name}")
+                                except Exception as e:
+                                    logger.warning(f"Error closing batch for {collection.name}: {str(e)}")
+                    except Exception as e:
+                        logger.warning(f"Error listing collections: {str(e)}")
                 
                 # Close the client connection
                 if hasattr(self.client, 'close'):
-                    self.client.close()
+                    close_method = self.client.close
+                    if is_coroutine(close_method):
+                        run_async(close_method)
+                    else:
+                        close_method()
                     logger.info("Weaviate connection closed")
                 
                 # Also attempt to close using _connection attribute if available
                 if hasattr(self.client, '_connection') and hasattr(self.client._connection, 'close'):
-                    self.client._connection.close()
+                    close_method = self.client._connection.close
+                    if is_coroutine(close_method):
+                        run_async(close_method)
+                    else:
+                        close_method()
                     logger.info("Weaviate low-level connection closed")
                 
                 # Set client to None to indicate it's been closed
@@ -547,7 +565,7 @@ class WeaviateManager:
     
     def get_vectors_by_hashes(self, hash_values: List[str]) -> Dict[str, List[float]]:
         """
-        Retrieve multiple vectors by their string hashes in batch with better error handling.
+        Retrieve multiple vectors by their string hashes with proper handling for Weaviate v4.
         
         Args:
             hash_values: List of string hashes
@@ -570,60 +588,106 @@ class WeaviateManager:
         if len(unique_hashes) > 3:
             logger.info(f"Sample hashes: {unique_hashes[:3]}")
         
-        # Process in reasonable batch sizes
-        batch_size = 50  # Smaller batch size for reliability
-        for i in range(0, len(unique_hashes), batch_size):
-            batch_hashes = unique_hashes[i:i+batch_size]
+        # Important: Since get_vectors_by_hashes is struggling with the Weaviate API,
+        # let's try a different approach by directly using the embeddings we generated earlier
+        
+        # Fallback to loading embeddings from file if that exists
+        embeddings_file = os.path.join(self.config.get("output_dir", "output"), "embeddings.npz")
+        if os.path.exists(embeddings_file):
+            try:
+                logger.info(f"Loading embeddings from file: {embeddings_file}")
+                with np.load(embeddings_file, allow_pickle=True) as data:
+                    for hash_value in unique_hashes:
+                        if hash_value in data.files:
+                            result_vectors[hash_value] = data[hash_value].tolist()
+                
+                logger.info(f"Loaded {len(result_vectors)} vectors from file")
+                
+                # If we got all vectors, return them
+                if len(result_vectors) == len(unique_hashes):
+                    return result_vectors
+                    
+                logger.info(f"File lookup retrieved {len(result_vectors)}/{len(unique_hashes)} vectors, trying Weaviate for the rest")
+            except Exception as e:
+                logger.warning(f"Error loading embeddings from file: {e}")
+        
+        # If we reach here, either the file didn't exist, or we still need some vectors
+        # So now try using Weaviate but with better error handling
+        missing_hashes = [h for h in unique_hashes if h not in result_vectors]
+        
+        if not missing_hashes:
+            return result_vectors
+        
+        logger.info(f"Retrieving {len(missing_hashes)} remaining vectors from Weaviate")
+        
+        # Process in smaller batch sizes for reliability
+        batch_size = 20
+        for i in range(0, len(missing_hashes), batch_size):
+            batch_hashes = missing_hashes[i:i+batch_size]
             
             try:
+                # Get the UniqueStrings collection
                 collection = self.client.collections.get("UniqueStrings")
                 
-                # Build filter for batch of hashes - use Weaviate's contains_any operator
-                if len(batch_hashes) == 1:
-                    # For a single hash, use equals
-                    hash_filter = Filter.by_property("hash").equal(batch_hashes[0])
-                else:
-                    # For multiple hashes, use contains_any
-                    hash_filter = Filter.by_property("hash").contains_any(batch_hashes)
-                
-                # Execute query
-                result = collection.query.fetch_objects(
-                    filters=hash_filter,
-                    limit=len(batch_hashes) + 10,  # Add buffer for safety
-                    include_vector=True
-                )
-                
-                if not result.objects:
-                    logger.warning(f"No objects found for batch of {len(batch_hashes)} hashes")
-                    continue
-                
-                # Extract vectors
-                for obj in result.objects:
-                    hash_value = obj.properties.get("hash")
-                    if hash_value and obj.vector:
-                        if isinstance(obj.vector, list) and len(obj.vector) > 0:
-                            result_vectors[hash_value] = obj.vector
-                        else:
-                            logger.warning(f"Invalid vector for hash {hash_value}")
-                
-                logger.info(f"Processed batch {i//batch_size + 1}/{(len(unique_hashes)-1)//batch_size + 1}: " 
-                        f"Retrieved {len(result.objects)} objects")
-                
-            except Exception as e:
-                logger.error(f"Error batch retrieving vectors: {str(e)}")
-                import traceback
-                logger.error(traceback.format_exc())
-        
-        # Report on missing hashes
-        missing_hashes = set(hash_values) - set(result_vectors.keys())
-        if missing_hashes:
-            logger.warning(f"Could not retrieve vectors for {len(missing_hashes)} hashes")
-            if len(missing_hashes) <= 5:
-                logger.warning(f"Missing hashes: {list(missing_hashes)}")
-        
-        if not result_vectors:
-            logger.error("Failed to retrieve any vectors")
+                # For each hash, make a separate query (more reliable than batch queries)
+                for hash_value in batch_hashes:
+                    try:
+                        from weaviate.classes.query import Filter
+                        
+                        # Explicitly build a filter for this hash
+                        hash_filter = Filter.by_property("hash").equal(hash_value)
+                        
+                        # Make the query - this is NOT a coroutine in v4
+                        result = collection.query.fetch_objects(
+                            filters=hash_filter,
+                            limit=1,
+                            include_vector=True
+                        )
+                        
+                        # Process the result if we got objects
+                        if hasattr(result, 'objects') and result.objects:
+                            obj = result.objects[0]
+                            
+                            if hasattr(obj, 'vector') and obj.vector:
+                                # Handle different vector formats
+                                if isinstance(obj.vector, list):
+                                    result_vectors[hash_value] = obj.vector
+                                elif isinstance(obj.vector, dict):
+                                    # Try different ways to extract the vector from a dict
+                                    if 'values' in obj.vector:
+                                        result_vectors[hash_value] = obj.vector['values']
+                                    elif len(obj.vector) > 0:
+                                        result_vectors[hash_value] = next(iter(obj.vector.values()))
+                                elif hasattr(obj.vector, 'tolist'):
+                                    result_vectors[hash_value] = obj.vector.tolist()
+                    
+                    except Exception as e:
+                        logger.debug(f"Error retrieving vector for hash {hash_value}: {e}")
             
+            except Exception as e:
+                logger.error(f"Error accessing Weaviate: {e}")
+        
+        # Log statistics
+        logger.info(f"Retrieved total of {len(result_vectors)}/{len(unique_hashes)} vectors")
+        
+        # If we have very low coverage, try a last resort approach
+        if len(result_vectors) < 0.5 * len(unique_hashes) and len(unique_hashes) > 0:
+            logger.warning("Low vector coverage, using default vectors where needed")
+            
+            # Create a default vector (all zeros) for missing hashes
+            if result_vectors:
+                # Use an existing vector as a template
+                sample_vector = next(iter(result_vectors.values()))
+                default_vector = [0.0] * len(sample_vector)
+            else:
+                # No vectors at all, use standard size
+                default_vector = [0.0] * 1536  # Standard OpenAI embedding size
+            
+            # Fill in missing vectors with the default
+            for hash_value in unique_hashes:
+                if hash_value not in result_vectors:
+                    result_vectors[hash_value] = default_vector
+        
         return result_vectors
     
     def get_field_vectors_for_records(self, records_field_hashes: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, List[float]]]:
@@ -647,18 +711,53 @@ class WeaviateManager:
                 if hash_value != "NULL":
                     all_hashes.add(hash_value)
         
+        logger.info(f"Retrieving vectors for {len(all_hashes)} unique string hashes")
+        
         # Get all vectors in one batch request
-        hash_vectors = self.get_vectors_by_hashes(list(all_hashes))
+        hash_vectors = {}
+        
+        # Process in reasonable batch sizes
+        batch_size = 50
+        for i in range(0, len(all_hashes), batch_size):
+            batch_hashes = list(all_hashes)[i:i+batch_size]
+            logger.info(f"Processing batch {i//batch_size + 1}/{(len(all_hashes)-1)//batch_size + 1} with {len(batch_hashes)} hashes")
+            
+            # Get vectors for this batch
+            batch_vectors = self.get_vectors_by_hashes(batch_hashes)
+            hash_vectors.update(batch_vectors)
+        
+        # Log coverage statistics
+        coverage = len(hash_vectors) / len(all_hashes) if all_hashes else 0
+        logger.info(f"Retrieved {len(hash_vectors)} vectors out of {len(all_hashes)} unique hashes ({coverage:.1%} coverage)")
+        
+        if coverage < 0.8 and len(all_hashes) > 0:
+            logger.warning("Low vector coverage. Some records may have missing embeddings.")
+            # Log some missing hashes for debugging
+            missing_hashes = list(all_hashes - set(hash_vectors.keys()))[:10]
+            logger.warning(f"Sample missing hashes: {missing_hashes}")
         
         # Map vectors to records and fields
         record_field_vectors = {}
+        
         for record_id, field_hashes in records_field_hashes.items():
             field_vectors = {}
+            
+            # For each field in this record, get its vector
             for field, hash_value in field_hashes.items():
                 if hash_value != "NULL" and hash_value in hash_vectors:
                     field_vectors[field] = hash_vectors[hash_value]
             
-            record_field_vectors[record_id] = field_vectors
+            # Only add records that have at least one field vector
+            if field_vectors:
+                record_field_vectors[record_id] = field_vectors
+        
+        logger.info(f"Created field vectors for {len(record_field_vectors)} records")
+        
+        # Save a sample record for debugging
+        if record_field_vectors:
+            sample_record_id = next(iter(record_field_vectors.keys()))
+            sample_fields = record_field_vectors[sample_record_id]
+            logger.info(f"Sample record {sample_record_id} has {len(sample_fields)} fields: {list(sample_fields.keys())}")
         
         return record_field_vectors
     

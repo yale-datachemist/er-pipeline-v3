@@ -13,9 +13,6 @@ from logging_setup import setup_logging, _log_handlers  # Import the new logging
 # Set up logging with proper handler management
 logger = setup_logging()
 
-
-# Import reporting integration
-import reporting_integration
 # Global reference to pipeline for cleanup handlers
 pipeline_instance = None
 
@@ -249,9 +246,6 @@ def main():
     try:
         # Initialize pipeline
         pipeline_instance = EntityResolutionPipeline(args.config)
-
-        # Integrate reporting capabilities
-        reporting_integration.integrate_classification_reporting(pipeline_instance)
         
         # Override configuration settings from command line
         if args.mode:
