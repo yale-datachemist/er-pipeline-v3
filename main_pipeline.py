@@ -201,9 +201,41 @@ class EntityResolutionPipeline:
     
     def _restore_checkpoint_data(self) -> None:
         """
-        Restore data from checkpoints.
+        Restore data from checkpoints with improved record field hashes loading.
         """
         completed_stages = self.checkpoint_state.get("completed_stages", [])
+        
+        # Restore record field hashes first since many other stages depend on it
+        record_hashes_path = os.path.join(self.checkpoint_dir, "record_field_hashes.json")
+        if os.path.exists(record_hashes_path):
+            try:
+                with open(record_hashes_path, 'r') as f:
+                    self.data_processor.deduplicator.record_field_hashes = json.load(f)
+                logger.info(f"Restored {len(self.data_processor.deduplicator.record_field_hashes)} record field hashes")
+                
+                # Also restore unique strings
+                unique_strings_path = os.path.join(self.checkpoint_dir, "unique_strings.json")
+                if os.path.exists(unique_strings_path):
+                    with open(unique_strings_path, 'r') as f:
+                        self.data_processor.deduplicator.unique_strings = json.load(f)
+                    logger.info(f"Restored {len(self.data_processor.deduplicator.unique_strings)} unique strings")
+                    
+                # Restore string counts if available
+                string_counts_path = os.path.join(self.checkpoint_dir, "string_counts.json")
+                if os.path.exists(string_counts_path):
+                    with open(string_counts_path, 'r') as f:
+                        self.data_processor.deduplicator.string_counts = defaultdict(int, json.load(f))
+                    logger.info(f"Restored string counts dictionary")
+                    
+                # Restore field types if available
+                field_types_path = os.path.join(self.checkpoint_dir, "field_types.json")
+                if os.path.exists(field_types_path):
+                    with open(field_types_path, 'r') as f:
+                        self.data_processor.deduplicator.field_types = json.load(f)
+                    logger.info(f"Restored field types dictionary")
+                    
+            except Exception as e:
+                logger.warning(f"Error loading record field hashes: {str(e)}")
         
         # Restore embeddings if embedding stage was completed
         if "embedding_generation" in completed_stages:
@@ -223,7 +255,7 @@ class EntityResolutionPipeline:
                 logger.info(f"Restored classifier model and scaler")
         
         # Restore record embeddings if indexing stage was completed
-        if "record_indexing" in completed_stages:
+        if "record_indexing" in completed_stages or "string_indexing" in completed_stages:
             embeddings_file = os.path.join(self.checkpoint_dir, "record_embeddings.pkl")
             if os.path.exists(embeddings_file):
                 try:
@@ -605,7 +637,7 @@ class EntityResolutionPipeline:
         return train_records, test_records, ground_truth_pairs
     
     def train_classifier(self, train_records: Dict[str, Dict], test_records: Dict[str, Dict], 
-                      ground_truth_pairs: List[Tuple]) -> None:
+                  ground_truth_pairs: List[Tuple]) -> None:
         """
         Train and evaluate the classifier, and perform clustering on the training data.
         

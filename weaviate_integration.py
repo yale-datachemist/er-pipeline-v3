@@ -656,9 +656,34 @@ class WeaviateManager:
         try:
             collection = self.client.collections.get("UniqueStrings")
             
-            # Build query
+            # Ensure vector is a flat list of floats, not a nested structure
+            if isinstance(query_vector, dict):
+                logger.warning(f"Vector is a dictionary, extracting values: {list(query_vector.keys())}")
+                # Try to extract the vector from the dictionary
+                if 'default' in query_vector:
+                    query_vector = query_vector['default']
+                else:
+                    # Take the first value if default not found
+                    query_vector = next(iter(query_vector.values()))
+            
+            # Ensure vector is a numpy array and convert to list
+            if hasattr(query_vector, 'tolist'):
+                query_vector = query_vector.tolist()
+            
+            # Validate vector format
+            if not isinstance(query_vector, list) or not all(isinstance(x, (int, float)) for x in query_vector):
+                logger.error(f"Invalid vector format: {type(query_vector)}")
+                return []
+            
+            # Make sure the vector has the expected dimensionality (1536 for OpenAI embeddings)
+            expected_dim = 1536
+            if len(query_vector) != expected_dim:
+                logger.error(f"Vector has incorrect dimensionality: {len(query_vector)}, expected {expected_dim}")
+                return []
+            
+            # Build query - using near_vector as per Weaviate documentation
             query = collection.query.near_vector(
-                near_vector=query_vector,
+                near_vector=query_vector,  # Use 'near_vector' as per documentation
                 limit=limit,
                 return_metadata=MetadataQuery(distance=True),
                 include_vector=True
@@ -689,8 +714,113 @@ class WeaviateManager:
             
         except Exception as e:
             logger.error(f"Error searching similar strings: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
-    
+
+    # Also add a missing search_neighbors method with the correct parameter name
+    def search_neighbors(
+        self,
+        query_vector: List[float],
+        limit: int = 50,
+        distance_threshold: float = 0.3
+    ) -> List[Dict]:
+        """
+        Search for nearest neighbors to the query vector.
+        
+        Args:
+            query_vector: Query vector embedding
+            limit: Maximum number of results
+            distance_threshold: Maximum distance threshold
+            
+        Returns:
+            List of neighbor records with their vectors and distances
+        """
+        if not self.client:
+            logger.error("Not connected to Weaviate")
+            return []
+        
+        try:
+            collection = self.client.collections.get("UniqueStrings")
+            
+            # Ensure vector is a flat list of floats
+            if isinstance(query_vector, dict):
+                logger.warning(f"Vector is a dictionary, extracting values")
+                if 'default' in query_vector:
+                    query_vector = query_vector['default']
+                else:
+                    query_vector = next(iter(query_vector.values()))
+            
+            # Ensure vector is a list, not numpy array
+            if hasattr(query_vector, 'tolist'):
+                query_vector = query_vector.tolist()
+            
+            # Build query with correct parameter name
+            query = collection.query.near_vector(
+                near_vector=query_vector,  # Using near_vector as per documentation 
+                limit=limit,
+                return_metadata=MetadataQuery(distance=True),
+                include_vector=True
+            )
+            
+            # Execute query focusing on person records
+            query = query.with_filter(
+                collection.query.filter.by_property("field_type").equal("person")
+            )
+            
+            result = query.fetch_objects()
+            
+            # Process results
+            neighbors = []
+            for obj in result.objects:
+                # Get the hash to find entity IDs that use this person hash
+                hash_value = obj.properties.get("hash", "")
+                if not hash_value:
+                    continue
+                
+                # Find entities using this person hash
+                entity_collection = self.client.collections.get("EntityMap")
+                filter_str = f'{{field_hashes_json: {{path: ["person"], equals: "{hash_value}"}}}}'
+                
+                entity_results = entity_collection.query.raw(
+                    f"""
+                    {{
+                        Get {{
+                            EntityMap(
+                                where: {filter_str}
+                                limit: 5
+                            ) {{
+                                entity_id
+                                person_name
+                                field_hashes_json
+                            }}
+                        }}
+                    }}
+                    """
+                )
+                
+                # Process entity results
+                entities = entity_results.get("data", {}).get("Get", {}).get("EntityMap", [])
+                for entity in entities:
+                    entity_id = entity.get("entity_id")
+                    
+                    # Use entity ID to fetch full record if needed
+                    neighbors.append({
+                        "id": entity_id,
+                        "person": obj.properties.get("text", ""),
+                        "hash": hash_value,
+                        "distance": obj.metadata.distance,
+                        "vector": obj.vector
+                    })
+            
+            return neighbors
+            
+        except Exception as e:
+            logger.error(f"Error searching neighbors: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
+        
     def get_imputation_candidates(
         self, 
         query_vector: List[float], 

@@ -540,13 +540,17 @@ class EntityClusterer:
                         continue
                         
                     # Get full records from graph
-                    candidate_record = graph.nodes[candidate_id]
+                    if candidate_id in graph.nodes:
+                        candidate_record = dict(graph.nodes[candidate_id])
+                    else:
+                        # Skip if candidate record is not in the graph
+                        continue
                     
                     # Handle null values through imputation
-                    if any(pd.isna(record.get(field)) for field in self.imputer.imputable_fields):
+                    if any(pd.isna(record.get(field)) for field in self.imputer.imputable_fields if field in record):
                         record = self.imputer.impute_null_fields(record, embeddings_map[record_id])
                         
-                    if any(pd.isna(candidate_record.get(field)) for field in self.imputer.imputable_fields):
+                    if any(pd.isna(candidate_record.get(field)) for field in self.imputer.imputable_fields if field in candidate_record):
                         candidate_record = self.imputer.impute_null_fields(candidate_record, embeddings_map[candidate_id])
                     
                     # Classify the pair
