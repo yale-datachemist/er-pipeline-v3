@@ -32,13 +32,12 @@ class FeatureEngineer:
         self.scaler = StandardScaler()
         self.field_weights = {
             "person": 1.0,
-            "roles": 0.7,
-            "title": 0.9,
-            "attribution": 0.8,
+            "roles": 0.5,
+            "title": 0.8,
+            ##"attribution": 0.8,
             "provision": 0.6,
-            "subjects": 0.7,
-            "genres": 0.5,
-            "relatedWork": 0.6,
+            "subjects": 0.9,
+            "genres": 0.5,            
             "record": 0.8
         }
     
@@ -439,7 +438,7 @@ class FeatureEngineer:
                 features[f"{field}_len_ratio"] = min(len1, len2) / max(len1, len2) if max(len1, len2) > 0 else 0.0
             
             # Field presence indicators
-            for field in ["attribution", "provision", "subjects", "genres", "relatedWork"]:
+            for field in "provision", "subjects", "genres"]:
                 features[f"{field}_present_both"] = 1.0 if (record1.get(field) and record2.get(field)) else 0.0
                 features[f"{field}_present_none"] = 1.0 if (not record1.get(field) and not record2.get(field)) else 0.0
                 features[f"{field}_present_one"] = 1.0 if (bool(record1.get(field)) != bool(record2.get(field))) else 0.0

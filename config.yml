@@ -52,11 +52,11 @@ field_weights:
   person: 1.0
   roles: 0.5
   title: 0.8
-  attribution: 0.5
+  #attribution: 0.5
   provision: 0.6
   subjects: 0.9
   genres: 0.5
-  relatedWork: 0.5
+  #relatedWork: 0.5
   record: 0.8
 
 # Classifier settings
@@ -124,13 +124,13 @@ environment:
 
 # Field-specific weights based on presence and imputation status
 field_presence_weights:
-  attribution:
-    both_present: 1.2
-    both_absent: 0.8
-    one_present: 0.5
-    first_present_second_imputed: 0.7
-    first_imputed_second_present: 0.7
-    both_imputed: 0.4
+  #attribution:
+  #  both_present: 1.2
+  #  both_absent: 0.8
+  #  one_present: 0.5
+  #  first_present_second_imputed: 0.7
+  #  first_imputed_second_present: 0.7
+  #  both_imputed: 0.4
   provision:
     both_present: 1.5
     both_absent: 0.7
@@ -152,10 +152,10 @@ field_presence_weights:
     first_present_second_imputed: 0.8
     first_imputed_second_present: 0.8
     both_imputed: 0.6
-  relatedWork:
-    both_present: 1.4
-    both_absent: 0.8
-    one_present: 0.6
-    first_present_second_imputed: 0.9
-    first_imputed_second_present: 0.9
-    both_imputed: 0.5
+  #relatedWork:
+  #  both_present: 1.4
+  #  both_absent: 0.8
+  #  one_present: 0.6
+  #  first_present_second_imputed: 0.9
+  #  first_imputed_second_present: 0.9
+  #  both_imputed: 0.5

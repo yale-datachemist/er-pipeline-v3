@@ -31,12 +31,12 @@ class TextDeduplicator:
         
         # Fields to deduplicate and embed
         self.embed_fields = [
-            'record', 'person', 'roles', 'title', 'attribution', 
-            'provision', 'subjects', 'genres', 'relatedWork'
+            'record', 'person', 'roles', 'title' 
+            'provision', 'subjects', 'genres'
         ]
         # Fields that might contain null values
         self.nullable_fields = [
-            'attribution', 'provision', 'subjects', 'genres', 'relatedWork'
+            'provision', 'subjects', 'genres'
         ]
         # Track unique strings and their frequencies
         self.unique_strings: Dict[str, str] = {}  # hash -> original string

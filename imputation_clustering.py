@@ -33,7 +33,7 @@ class NullValueImputer:
         self.config = config
         self.weaviate_manager = weaviate_manager
         self.imputation_cache = {}  # Cache for imputed values
-        self.imputable_fields = ["attribution", "provision", "subjects", "genres", "relatedWork"]
+        self.imputable_fields = ["provision", "subjects", "genres"]
         self.num_neighbors = config.get("imputation_neighbors", 10)
     
     def impute_null_fields(self, record: Dict, embeddings: Dict[str, List[float]]) -> Dict:

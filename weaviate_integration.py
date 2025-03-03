@@ -41,8 +41,8 @@ class WeaviateManager:
         
         # Fields to embed
         self.embedable_fields = [
-            "record", "person", "roles", "title", "attribution", 
-            "provision", "subjects", "genres", "relatedWork"
+            "record", "person", "roles", "title", 
+            "provision", "subjects", "genres"
         ]
         
         # Define the collection schema
